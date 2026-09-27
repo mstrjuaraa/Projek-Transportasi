@@ -6,21 +6,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .analysis import analyze_video
-
-
-# =========================================================
-# BASIC CONFIGURATION
-# =========================================================
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-MEDIA_DIR = BASE_DIR / "media"
-MEDIA_DIR.mkdir(exist_ok=True)
-
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "150"))
 
 
 # =========================================================
@@ -41,21 +30,25 @@ app = FastAPI(
 # CORS
 # =========================================================
 
-cors_origins = os.getenv("CORS_ORIGINS", "*")
-
-origins = [
-    origin.strip()
-    for origin in cors_origins.split(",")
-    if origin.strip()
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or ["*"],
-    allow_credentials=False,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================================================
+# FOLDER
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MEDIA_DIR = BASE_DIR / "media"
+UPLOAD_DIR = MEDIA_DIR / "uploads"
+
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =========================================================
@@ -76,12 +69,9 @@ app.mount(
 @app.get("/")
 def root():
     return {
-        "service": "Integrated Cihampelas Mobility AI Backend",
         "status": "online",
-        "message": "Backend berhasil dijalankan.",
-        "docs": "/docs",
-        "health": "/health",
-        "demo": "/demo",
+        "service": "Integrated Cihampelas Mobility AI Backend",
+        "version": "0.1.0",
     }
 
 
@@ -92,7 +82,7 @@ def root():
 @app.get("/health")
 def health():
     return {
-        "status": "ok"
+        "status": "healthy"
     }
 
 
@@ -100,193 +90,104 @@ def health():
 # DEMO PAGE
 # =========================================================
 
-@app.get("/demo", response_class=HTMLResponse)
+@app.get("/demo")
 def demo():
-    demo_path = BASE_DIR / "app" / "demo.html"
+    demo_file = BASE_DIR / "app" / "demo.html"
 
-    if not demo_path.exists():
-        return HTMLResponse(
-            content="<h1>Demo page belum tersedia.</h1>",
+    if not demo_file.exists():
+        raise HTTPException(
             status_code=404,
+            detail="demo.html tidak ditemukan."
         )
 
-    return demo_path.read_text(encoding="utf-8")
+    return FileResponse(str(demo_file))
 
 
 # =========================================================
-# VIDEO ANALYSIS
+# ANALYZE VIDEO
 # =========================================================
 
 @app.post("/analyze")
 async def analyze(
     video: UploadFile = File(...),
-    location: str = Form("Cihampelas"),
-    config: str = Form("{}"),
+    route: str = Form("Cihampelas"),
+    calibration_distance_m: float = Form(0.0),
+    line_a_y: float = Form(0.0),
+    line_b_y: float = Form(0.0),
 ):
-    """
-    Menerima video dan mengirimkannya ke video analysis engine.
-
-    Form:
-    - video     : file video
-    - location  : Cihampelas / Cipaganti
-    - config    : JSON konfigurasi kamera
-    """
-
-    # -----------------------------------------------------
-    # VALIDATE FILE NAME
-    # -----------------------------------------------------
-
     if not video.filename:
         raise HTTPException(
             status_code=400,
-            detail="Nama file video tidak tersedia.",
+            detail="File video tidak memiliki nama."
         )
-
-    # -----------------------------------------------------
-    # VALIDATE EXTENSION
-    # -----------------------------------------------------
-
-    extension = Path(video.filename).suffix.lower()
 
     allowed_extensions = {
         ".mp4",
-        ".mov",
         ".avi",
+        ".mov",
         ".mkv",
         ".webm",
-        ".m4v",
     }
 
-    if extension not in allowed_extensions:
+    suffix = Path(video.filename).suffix.lower()
+
+    if suffix not in allowed_extensions:
         raise HTTPException(
             status_code=400,
             detail=(
                 "Format video tidak didukung. "
-                "Gunakan MP4, MOV, AVI, MKV, WEBM, atau M4V."
+                "Gunakan MP4, AVI, MOV, MKV, atau WEBM."
             ),
         )
 
     # -----------------------------------------------------
-    # VALIDATE CONFIG
+    # Simpan video asli
     # -----------------------------------------------------
+
+    video_id = str(uuid.uuid4())
+    saved_filename = f"{video_id}{suffix}"
+    saved_path = UPLOAD_DIR / saved_filename
 
     try:
-        camera_config = json.loads(config)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Config kamera tidak valid: {exc}",
-        ) from exc
-
-    # -----------------------------------------------------
-    # CREATE UNIQUE JOB DIRECTORY
-    # -----------------------------------------------------
-
-    job_id = str(uuid.uuid4())
-
-    job_dir = MEDIA_DIR / job_id
-    job_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    input_filename = f"source{extension}"
-    input_path = job_dir / input_filename
-
-    # -----------------------------------------------------
-    # SAVE UPLOADED VIDEO
-    # -----------------------------------------------------
-
-    total_size = 0
-
-    try:
-        with input_path.open("wb") as output_file:
-
-            while True:
-
-                chunk = await video.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                total_size += len(chunk)
-
-                if total_size > MAX_UPLOAD_MB * 1024 * 1024:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"Ukuran video melebihi batas "
-                            f"{MAX_UPLOAD_MB} MB."
-                        ),
-                    )
-
-                output_file.write(chunk)
-
-    except HTTPException:
-        shutil.rmtree(
-            job_dir,
-            ignore_errors=True,
-        )
-        raise
+        with saved_path.open("wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
 
     except Exception as exc:
-        shutil.rmtree(
-            job_dir,
-            ignore_errors=True,
-        )
-
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Gagal menyimpan video: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        ) from exc
+            detail=f"Gagal menyimpan video: {exc}",
+        )
 
     # -----------------------------------------------------
-    # RUN AI ANALYSIS
+    # Analisis AI
     # -----------------------------------------------------
 
     try:
-
         result = analyze_video(
-            video_path=input_path,
-            location=location,
-            config=camera_config,
-            job_id=job_id,
+            video_path=str(saved_path),
+            route=route,
+            calibration_distance_m=calibration_distance_m,
+            line_a_y=line_a_y,
+            line_b_y=line_b_y,
         )
 
     except Exception as exc:
-
-        shutil.rmtree(
-            job_dir,
-            ignore_errors=True,
-        )
+        # hapus file jika analisis gagal
+        try:
+            saved_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Analisis video gagal: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        ) from exc
+            detail=f"Analisis video gagal: {exc}",
+        )
 
     # -----------------------------------------------------
-    # ADD FILE INFORMATION
+    # URL video asli
     # -----------------------------------------------------
 
-    result["job_id"] = job_id
-
-    result["source_filename"] = video.filename
-
-    result["source_video_url"] = (
-        f"/media/{job_id}/{input_filename}"
-    )
-
-    result["uploaded_size_bytes"] = total_size
-
-    # -----------------------------------------------------
-    # RETURN RESULT
-    # -----------------------------------------------------
+    result["video_url"] = f"/media/uploads/{saved_filename}"
+    result["route"] = route
 
     return result
