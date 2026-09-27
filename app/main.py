@@ -1,8 +1,8 @@
-import json
 import os
 import shutil
 import uuid
 from pathlib import Path
+from threading import Thread
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,16 +13,16 @@ from .analysis import analyze_video
 
 
 # =========================================================
-# FASTAPI APP
+# APP
 # =========================================================
 
 app = FastAPI(
     title="Integrated Cihampelas Mobility AI Backend",
     description=(
-        "Backend prototype untuk analisis video lalu lintas "
+        "Backend analisis video lalu lintas "
         "Jalan Cihampelas dan Jalan Cipaganti."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -63,6 +63,58 @@ app.mount(
 
 
 # =========================================================
+# JOB STORAGE
+#
+# Untuk prototype:
+# status disimpan di memory.
+# =========================================================
+
+JOBS = {}
+
+
+# =========================================================
+# BACKGROUND ANALYSIS
+# =========================================================
+
+def run_analysis_job(
+    job_id: str,
+    video_path: str,
+    route: str,
+    calibration_distance_m: float,
+    line_a_y: float,
+    line_b_y: float,
+):
+    try:
+
+        JOBS[job_id]["status"] = "processing"
+
+        result = analyze_video(
+            video_path=video_path,
+            route=route,
+            calibration_distance_m=calibration_distance_m,
+            line_a_y=line_a_y,
+            line_b_y=line_b_y,
+        )
+
+        filename = Path(video_path).name
+
+        result["video_url"] = (
+            f"/media/uploads/{filename}"
+        )
+
+        result["job_id"] = job_id
+
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["result"] = result
+
+    except Exception as exc:
+
+        JOBS[job_id]["status"] = "failed"
+
+        JOBS[job_id]["error"] = str(exc)
+
+
+# =========================================================
 # ROOT
 # =========================================================
 
@@ -71,40 +123,44 @@ def root():
     return {
         "status": "online",
         "service": "Integrated Cihampelas Mobility AI Backend",
-        "version": "0.1.0",
+        "version": "0.2.0",
     }
 
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.get("/health")
 def health():
     return {
-        "status": "healthy"
+        "status": "healthy",
+        "jobs": len(JOBS),
     }
 
 
 # =========================================================
-# DEMO PAGE
+# DEMO
 # =========================================================
 
 @app.get("/demo")
 def demo():
+
     demo_file = BASE_DIR / "app" / "demo.html"
 
     if not demo_file.exists():
         raise HTTPException(
             status_code=404,
-            detail="demo.html tidak ditemukan."
+            detail="demo.html tidak ditemukan.",
         )
 
-    return FileResponse(str(demo_file))
+    return FileResponse(
+        str(demo_file)
+    )
 
 
 # =========================================================
-# ANALYZE VIDEO
+# START ANALYSIS JOB
 # =========================================================
 
 @app.post("/analyze")
@@ -115,10 +171,11 @@ async def analyze(
     line_a_y: float = Form(0.0),
     line_b_y: float = Form(0.0),
 ):
+
     if not video.filename:
         raise HTTPException(
             status_code=400,
-            detail="File video tidak memiliki nama."
+            detail="Nama file video tidak tersedia.",
         )
 
     allowed_extensions = {
@@ -129,7 +186,9 @@ async def analyze(
         ".webm",
     }
 
-    suffix = Path(video.filename).suffix.lower()
+    suffix = Path(
+        video.filename
+    ).suffix.lower()
 
     if suffix not in allowed_extensions:
         raise HTTPException(
@@ -141,53 +200,113 @@ async def analyze(
         )
 
     # -----------------------------------------------------
-    # Simpan video asli
+    # JOB ID
     # -----------------------------------------------------
 
-    video_id = str(uuid.uuid4())
-    saved_filename = f"{video_id}{suffix}"
-    saved_path = UPLOAD_DIR / saved_filename
+    job_id = str(uuid.uuid4())
+
+    filename = (
+        f"{job_id}{suffix}"
+    )
+
+    saved_path = (
+        UPLOAD_DIR / filename
+    )
+
+    # -----------------------------------------------------
+    # SIMPAN VIDEO
+    # -----------------------------------------------------
 
     try:
+
         with saved_path.open("wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
+
+            shutil.copyfileobj(
+                video.file,
+                buffer,
+            )
 
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal menyimpan video: {exc}",
-        )
-
-    # -----------------------------------------------------
-    # Analisis AI
-    # -----------------------------------------------------
-
-    try:
-        result = analyze_video(
-            video_path=str(saved_path),
-            route=route,
-            calibration_distance_m=calibration_distance_m,
-            line_a_y=line_a_y,
-            line_b_y=line_b_y,
-        )
-
-    except Exception as exc:
-        # hapus file jika analisis gagal
-        try:
-            saved_path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
         raise HTTPException(
             status_code=500,
-            detail=f"Analisis video gagal: {exc}",
+            detail=(
+                f"Gagal menyimpan video: {exc}"
+            ),
         )
 
     # -----------------------------------------------------
-    # URL video asli
+    # DAFTARKAN JOB
     # -----------------------------------------------------
 
-    result["video_url"] = f"/media/uploads/{saved_filename}"
-    result["route"] = route
+    JOBS[job_id] = {
+        "status": "queued",
+        "result": None,
+        "error": None,
+        "route": route,
+    }
 
-    return result
+    # -----------------------------------------------------
+    # JALANKAN ANALISIS DI BACKGROUND
+    # -----------------------------------------------------
+
+    thread = Thread(
+        target=run_analysis_job,
+        args=(
+            job_id,
+            str(saved_path),
+            route,
+            calibration_distance_m,
+            line_a_y,
+            line_b_y,
+        ),
+        daemon=True,
+    )
+
+    thread.start()
+
+    # -----------------------------------------------------
+    # LANGSUNG KEMBALIKAN JOB ID
+    # -----------------------------------------------------
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": (
+            "Video berhasil diunggah. "
+            "Analisis AI sedang diproses."
+        ),
+    }
+
+
+# =========================================================
+# CHECK JOB STATUS
+# =========================================================
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+
+    if job_id not in JOBS:
+
+        raise HTTPException(
+            status_code=404,
+            detail="JOB ID tidak ditemukan.",
+        )
+
+    job = JOBS[job_id]
+
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "route": job["route"],
+    }
+
+    if job["status"] == "completed":
+
+        response["result"] = job["result"]
+
+    if job["status"] == "failed":
+
+        response["error"] = job["error"]
+
+    return response
