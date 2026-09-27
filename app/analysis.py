@@ -1,4 +1,3 @@
-
 import os
 from collections import defaultdict
 
@@ -6,18 +5,8 @@ import cv2
 from ultralytics import YOLO
 
 
-# =========================================================
-# KONFIGURASI MODEL
-# =========================================================
-
 MODEL_NAME = os.getenv("MODEL_NAME", "yolo26n.pt")
 
-# COCO:
-# 1 = bicycle
-# 2 = car
-# 3 = motorcycle
-# 5 = bus
-# 7 = truck
 CLASS_MAP = {
     1: "sepeda",
     2: "mobil",
@@ -28,10 +17,10 @@ CLASS_MAP = {
 
 TRACK_CLASSES = list(CLASS_MAP.keys())
 
+# Model dimuat sekali ketika backend aktif,
+# bukan setiap kali user menekan tombol analisis.
+MODEL = YOLO(MODEL_NAME)
 
-# =========================================================
-# ANALISIS VIDEO
-# =========================================================
 
 def analyze_video(
     video_path: str,
@@ -40,40 +29,20 @@ def analyze_video(
     line_a_y: float = 0.0,
     line_b_y: float = 0.0,
 ):
-    """
-    Analisis video lalu lintas menggunakan YOLO + ByteTrack.
-
-    Output:
-    - jumlah kendaraan yang melewati counting line
-    - jumlah berdasarkan kelas
-    - flow rate kendaraan/menit
-    - estimasi kecepatan rata-rata m/s jika dikalibrasi
-    - estimasi kendaraan lambat/berhenti
-    - indikator kepadatan
-    """
-
     if not os.path.exists(video_path):
         raise FileNotFoundError(
             f"Video tidak ditemukan: {video_path}"
         )
 
-    # -----------------------------------------------------
-    # Buka video
-    # -----------------------------------------------------
-
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
         raise RuntimeError(
-            "Video tidak dapat dibuka oleh OpenCV."
+            "Video tidak dapat dibuka."
         )
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    if fps is None or fps <= 0:
-        fps = 25.0
-
-    frame_count = int(
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(
         cap.get(cv2.CAP_PROP_FRAME_COUNT)
     )
 
@@ -85,54 +54,47 @@ def analyze_video(
         cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     )
 
-    duration_seconds = (
-        frame_count / fps
-        if frame_count > 0
+    duration = (
+        total_frames / fps
+        if total_frames > 0
         else 0
     )
 
     # -----------------------------------------------------
-    # Counting line
+    # Counting line otomatis jika belum diatur
     # -----------------------------------------------------
 
-    if line_a_y > 0:
-        count_line_y = line_a_y
-    else:
-        count_line_y = height * 0.50
+    count_line_y = (
+        line_a_y
+        if line_a_y > 0
+        else height * 0.50
+    )
 
     # -----------------------------------------------------
-    # YOLO
-    # -----------------------------------------------------
-
-    model = YOLO(MODEL_NAME)
-
-    # -----------------------------------------------------
-    # Data tracking
+    # Tracking data
     # -----------------------------------------------------
 
     previous_centers = {}
 
     counted_ids = set()
 
-    counted_classes = defaultdict(int)
+    vehicle_counts = defaultdict(int)
 
-    track_history = defaultdict(list)
+    line_a_times = {}
+    line_b_times = {}
 
-    line_a_crossings = {}
-    line_b_crossings = {}
-
-    speed_measurements = []
-
-    # kendaraan aktif pada frame terakhir
-    current_active_ids = set()
-
-    # -----------------------------------------------------
-    # Queue estimation
-    # -----------------------------------------------------
-
-    slow_ids = set()
+    speed_values = []
 
     frame_index = 0
+
+    # -----------------------------------------------------
+    # Pemrosesan video
+    #
+    # Untuk video 4K, frame diperkecil ketika masuk YOLO.
+    # Video asli tetap disimpan sebagai sumber tampilan.
+    # -----------------------------------------------------
+
+    MAX_PROCESS_WIDTH = 1280
 
     while True:
 
@@ -141,18 +103,63 @@ def analyze_video(
         if not success:
             break
 
-        frame_time = frame_index / fps
+        current_time = frame_index / fps
+
+        # Resize hanya untuk AI
+        process_frame = frame
+
+        if width > MAX_PROCESS_WIDTH:
+
+            scale = (
+                MAX_PROCESS_WIDTH
+                / float(width)
+            )
+
+            new_height = int(
+                height * scale
+            )
+
+            process_frame = cv2.resize(
+                frame,
+                (
+                    MAX_PROCESS_WIDTH,
+                    new_height,
+                ),
+            )
+
+            process_count_line_y = (
+                count_line_y * scale
+            )
+
+            process_line_a_y = (
+                line_a_y * scale
+                if line_a_y > 0
+                else 0
+            )
+
+            process_line_b_y = (
+                line_b_y * scale
+                if line_b_y > 0
+                else 0
+            )
+
+        else:
+
+            process_count_line_y = count_line_y
+            process_line_a_y = line_a_y
+            process_line_b_y = line_b_y
 
         # -------------------------------------------------
-        # Deteksi + tracking
+        # YOLO + ByteTrack
         # -------------------------------------------------
 
-        results = model.track(
-            frame,
+        results = MODEL.track(
+            process_frame,
             persist=True,
             tracker="bytetrack.yaml",
             classes=TRACK_CLASSES,
             conf=0.25,
+            imgsz=640,
             verbose=False,
         )
 
@@ -166,26 +173,34 @@ def analyze_video(
             frame_index += 1
             continue
 
-        boxes = result.boxes
-
-        if boxes.id is None:
+        if result.boxes.id is None:
             frame_index += 1
             continue
 
-        ids = boxes.id.int().cpu().tolist()
-        classes = boxes.cls.int().cpu().tolist()
-        xyxy = boxes.xyxy.cpu().tolist()
+        ids = (
+            result.boxes.id
+            .int()
+            .cpu()
+            .tolist()
+        )
 
-        current_active_ids = set(ids)
+        classes = (
+            result.boxes.cls
+            .int()
+            .cpu()
+            .tolist()
+        )
 
-        # -------------------------------------------------
-        # Proses setiap kendaraan
-        # -------------------------------------------------
+        boxes = (
+            result.boxes.xyxy
+            .cpu()
+            .tolist()
+        )
 
-        for track_id, class_id, bbox in zip(
+        for track_id, class_id, box in zip(
             ids,
             classes,
-            xyxy,
+            boxes,
         ):
 
             if class_id not in CLASS_MAP:
@@ -193,253 +208,200 @@ def analyze_video(
 
             label = CLASS_MAP[class_id]
 
-            x1, y1, x2, y2 = bbox
+            x1, y1, x2, y2 = box
 
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
+            center_x = (
+                x1 + x2
+            ) / 2
 
-            track_history[track_id].append(
-                (
-                    frame_time,
-                    center_x,
-                    center_y,
-                )
+            center_y = (
+                y1 + y2
+            ) / 2
+
+            previous = previous_centers.get(
+                track_id
             )
-
-            # batasi history
-            if len(track_history[track_id]) > 30:
-                track_history[track_id] = (
-                    track_history[track_id][-30:]
-                )
-
-            # -------------------------------------------------
-            # Crossing detection
-            # -------------------------------------------------
-
-            previous = previous_centers.get(track_id)
 
             if previous is not None:
 
                 previous_y = previous[1]
 
-                # Kendaraan melewati counting line
-                crossed = (
-                    previous_y < count_line_y <= center_y
+                # -----------------------------------------
+                # Counting kendaraan
+                # -----------------------------------------
+
+                crossed_count_line = (
+                    previous_y
+                    < process_count_line_y
+                    <= center_y
                     or
-                    previous_y > count_line_y >= center_y
+                    previous_y
+                    > process_count_line_y
+                    >= center_y
                 )
 
-                if crossed and track_id not in counted_ids:
+                if (
+                    crossed_count_line
+                    and track_id not in counted_ids
+                ):
 
-                    counted_ids.add(track_id)
+                    counted_ids.add(
+                        track_id
+                    )
 
-                    counted_classes[label] += 1
+                    vehicle_counts[label] += 1
 
-                # -------------------------------------------------
-                # Speed line A
-                # -------------------------------------------------
+                # -----------------------------------------
+                # Line A
+                # -----------------------------------------
 
-                if line_a_y > 0:
+                if process_line_a_y > 0:
 
                     crossed_a = (
-                        previous_y < line_a_y <= center_y
+                        previous_y
+                        < process_line_a_y
+                        <= center_y
                         or
-                        previous_y > line_a_y >= center_y
+                        previous_y
+                        > process_line_a_y
+                        >= center_y
                     )
 
                     if (
                         crossed_a
-                        and track_id not in line_a_crossings
+                        and track_id
+                        not in line_a_times
                     ):
-                        line_a_crossings[track_id] = (
-                            frame_time
-                        )
 
-                # -------------------------------------------------
-                # Speed line B
-                # -------------------------------------------------
+                        line_a_times[
+                            track_id
+                        ] = current_time
 
-                if line_b_y > 0:
+                # -----------------------------------------
+                # Line B
+                # -----------------------------------------
+
+                if process_line_b_y > 0:
 
                     crossed_b = (
-                        previous_y < line_b_y <= center_y
+                        previous_y
+                        < process_line_b_y
+                        <= center_y
                         or
-                        previous_y > line_b_y >= center_y
+                        previous_y
+                        > process_line_b_y
+                        >= center_y
                     )
 
                     if (
                         crossed_b
-                        and track_id not in line_b_crossings
+                        and track_id
+                        not in line_b_times
                     ):
 
-                        line_b_crossings[track_id] = (
-                            frame_time
-                        )
+                        line_b_times[
+                            track_id
+                        ] = current_time
 
-                        # Hitung speed jika A sudah dilewati
-                        if track_id in line_a_crossings:
+                        if (
+                            track_id
+                            in line_a_times
+                        ):
 
-                            t_a = line_a_crossings[
-                                track_id
-                            ]
-
-                            t_b = line_b_crossings[
-                                track_id
-                            ]
+                            delta_t = (
+                                line_b_times[
+                                    track_id
+                                ]
+                                -
+                                line_a_times[
+                                    track_id
+                                ]
+                            )
 
                             delta_t = abs(
-                                t_b - t_a
+                                delta_t
                             )
 
                             if (
-                                calibration_distance_m > 0
-                                and delta_t > 0
+                                calibration_distance_m
+                                > 0
+                                and delta_t
+                                > 0
                             ):
 
-                                speed_mps = (
+                                speed = (
                                     calibration_distance_m
                                     / delta_t
                                 )
 
-                                # buang nilai yang tidak masuk akal
                                 if (
                                     0.1
-                                    <= speed_mps
-                                    <= 50
+                                    <= speed
+                                    <= 40
                                 ):
-                                    speed_measurements.append(
-                                        speed_mps
+
+                                    speed_values.append(
+                                        speed
                                     )
 
-            previous_centers[track_id] = (
+            previous_centers[
+                track_id
+            ] = (
                 center_x,
                 center_y,
             )
-
-            # -------------------------------------------------
-            # Slow / stopped vehicle estimation
-            # -------------------------------------------------
-
-            history = track_history[track_id]
-
-            if len(history) >= 5:
-
-                old_time, old_x, old_y = history[-5]
-
-                delta_time = (
-                    frame_time - old_time
-                )
-
-                if delta_time > 0:
-
-                    pixel_distance = (
-                        (
-                            center_x - old_x
-                        ) ** 2
-                        +
-                        (
-                            center_y - old_y
-                        ) ** 2
-                    ) ** 0.5
-
-                    pixel_speed = (
-                        pixel_distance
-                        / delta_time
-                    )
-
-                    # Kendaraan sangat lambat
-                    if pixel_speed < 20:
-                        slow_ids.add(track_id)
-
-                    else:
-                        slow_ids.discard(track_id)
 
         frame_index += 1
 
     cap.release()
 
     # =====================================================
-    # HASIL AKHIR
+    # HASIL
     # =====================================================
 
-    total_vehicles = len(counted_ids)
+    total = len(counted_ids)
 
-    # -----------------------------------------------------
-    # Flow rate
-    # -----------------------------------------------------
-
-    if duration_seconds > 0:
+    if duration > 0:
 
         flow_rate = (
-            total_vehicles
-            / (duration_seconds / 60.0)
+            total
+            / (duration / 60.0)
         )
 
     else:
+
         flow_rate = 0.0
 
-    # -----------------------------------------------------
-    # Speed
-    # -----------------------------------------------------
+    if speed_values:
 
-    if speed_measurements:
-
-        average_speed_mps = (
-            sum(speed_measurements)
-            / len(speed_measurements)
+        average_speed = (
+            sum(speed_values)
+            / len(speed_values)
         )
 
         speed_status = "terkalibrasi"
 
     else:
 
-        average_speed_mps = None
+        average_speed = None
 
         speed_status = "belum terkalibrasi"
 
     # -----------------------------------------------------
-    # Queue
+    # Status lalu lintas
     # -----------------------------------------------------
 
-    queued_vehicles = len(slow_ids)
-
-    # -----------------------------------------------------
-    # Density indicator
-    # -----------------------------------------------------
-
-    # Jumlah rata-rata kendaraan aktif relatif terhadap
-    # kapasitas indikator sederhana pada frame.
-    #
-    # Ini adalah indikator heuristik dari video,
-    # bukan kapasitas jalan resmi.
-
-    if total_vehicles == 0:
-
-        traffic_status = "TIDAK TERDETEKSI"
-
-        density_index = 0
-
-    elif flow_rate < 15:
+    if flow_rate < 15:
 
         traffic_status = "RENDAH"
-
-        density_index = 25
 
     elif flow_rate < 30:
 
         traffic_status = "SEDANG"
 
-        density_index = 55
-
     else:
 
         traffic_status = "TINGGI"
-
-        density_index = 85
-
-    # =====================================================
-    # RETURN
-    # =====================================================
 
     return {
         "route": route,
@@ -447,33 +409,36 @@ def analyze_video(
         "video": {
             "width": width,
             "height": height,
-            "fps": round(fps, 2),
-            "frame_count": frame_count,
+            "fps": round(
+                fps,
+                2,
+            ),
+            "frame_count": total_frames,
             "duration_seconds": round(
-                duration_seconds,
+                duration,
                 2,
             ),
         },
 
         "vehicles": {
-            "total": total_vehicles,
-            "motor": counted_classes.get(
+            "total": total,
+            "motor": vehicle_counts.get(
                 "motor",
                 0,
             ),
-            "mobil": counted_classes.get(
+            "mobil": vehicle_counts.get(
                 "mobil",
                 0,
             ),
-            "bus": counted_classes.get(
+            "bus": vehicle_counts.get(
                 "bus",
                 0,
             ),
-            "truk": counted_classes.get(
+            "truk": vehicle_counts.get(
                 "truk",
                 0,
             ),
-            "sepeda": counted_classes.get(
+            "sepeda": vehicle_counts.get(
                 "sepeda",
                 0,
             ),
@@ -484,58 +449,36 @@ def analyze_video(
                 flow_rate,
                 2,
             ),
-
-            "queued_vehicles_estimate": (
-                queued_vehicles
-            ),
-
-            "density_index": density_index,
-
             "status": traffic_status,
         },
 
         "speed": {
             "average_speed_mps": (
                 round(
-                    average_speed_mps,
+                    average_speed,
                     2,
                 )
-                if average_speed_mps is not None
+                if average_speed is not None
                 else None
             ),
-
             "status": speed_status,
-
             "samples": len(
-                speed_measurements
+                speed_values
             ),
         },
 
-        "counting": {
-            "counting_line_y": round(
-                float(count_line_y),
-                2,
-            ),
-
+        "calibration": {
             "line_a_y": (
-                round(
-                    float(line_a_y),
-                    2,
-                )
+                line_a_y
                 if line_a_y > 0
                 else None
             ),
-
             "line_b_y": (
-                round(
-                    float(line_b_y),
-                    2,
-                )
+                line_b_y
                 if line_b_y > 0
                 else None
             ),
-
-            "calibration_distance_m": (
+            "distance_m": (
                 calibration_distance_m
                 if calibration_distance_m > 0
                 else None
@@ -543,9 +486,9 @@ def analyze_video(
         },
 
         "method": {
-            "detection": "Ultralytics YOLO",
+            "source": "video asli",
+            "detection": "YOLO",
             "tracking": "ByteTrack",
-            "source": "video asli yang diunggah",
-            "random_traffic_profile": False,
+            "random_data": False,
         },
     }
