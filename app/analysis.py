@@ -16,8 +16,10 @@ CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.55"))
 # Naikkan ukuran inferensi agar objek kecil seperti motor lebih mudah terlihat.
 INFER_SIZE = int(os.getenv("INFER_SIZE", "1280"))
 
-TRACKER = os.getenv("TRACKER", "bytetrack.yaml")
-
+TRACKER = os.getenv(
+    "TRACKER",
+    "app/bytetrack_motor.yaml"
+)
 # COCO:
 # bicycle = 1
 # car = 2
