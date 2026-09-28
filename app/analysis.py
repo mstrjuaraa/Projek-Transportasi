@@ -14,7 +14,7 @@ PROCESS_FPS = float(os.getenv("PROCESS_FPS", "8"))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.55"))
 
 # Naikkan ukuran inferensi agar objek kecil seperti motor lebih mudah terlihat.
-INFER_SIZE = int(os.getenv("INFER_SIZE", "960"))
+INFER_SIZE = int(os.getenv("INFER_SIZE", "1280"))
 
 TRACKER = os.getenv("TRACKER", "bytetrack.yaml")
 
