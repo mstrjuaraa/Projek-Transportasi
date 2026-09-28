@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-MODEL_NAME = os.getenv("MODEL_NAME", "yolo26n.pt")
+MODEL_NAME = os.getenv("MODEL_NAME", "yolo26s.pt")
 PROCESS_FPS = float(os.getenv("PROCESS_FPS", "8"))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.55"))
 
