@@ -4,3 +4,4 @@ python-multipart>=0.0.20,<1.0
 opencv-python-headless>=4.10,<5.0
 numpy>=1.26,<3.0
 ultralytics>=8.4.63,<9.0
+lap>=0.5.12
