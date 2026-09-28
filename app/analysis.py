@@ -1,13 +1,48 @@
+from __future__ import annotations
+
 import os
+import time
 from collections import defaultdict
+from pathlib import Path
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
-MODEL_NAME = os.getenv("MODEL_NAME", "yolo26n.pt")
+MODEL_NAME = os.getenv(
+    "MODEL_NAME",
+    "yolo26n.pt",
+)
 
-CLASS_MAP = {
+PROCESS_FPS = float(
+    os.getenv(
+        "PROCESS_FPS",
+        "8",
+    )
+)
+
+CONF_THRESHOLD = float(
+    os.getenv(
+        "CONF_THRESHOLD",
+        "0.55",
+    )
+)
+
+TRACKER = os.getenv(
+    "TRACKER",
+    "bytetrack.yaml",
+)
+
+
+# COCO classes:
+# bicycle = 1
+# car = 2
+# motorcycle = 3
+# bus = 5
+# truck = 7
+
+TARGET_CLASSES = {
     1: "sepeda",
     2: "mobil",
     3: "motor",
@@ -15,480 +50,569 @@ CLASS_MAP = {
     7: "truk",
 }
 
-TRACK_CLASSES = list(CLASS_MAP.keys())
 
-# Model dimuat sekali ketika backend aktif,
-# bukan setiap kali user menekan tombol analisis.
-MODEL = YOLO(MODEL_NAME)
+MODEL = None
+
+
+def get_model():
+    global MODEL
+
+    if MODEL is None:
+        MODEL = YOLO(MODEL_NAME)
+
+    return MODEL
+
+
+def horizontal_line(
+    y: float | None,
+    width: int,
+):
+    if y is None:
+        return None
+
+    y = float(y)
+
+    return (
+        (0.0, y),
+        (float(width), y),
+    )
+
+
+def line_side(
+    point,
+    a,
+    b,
+):
+    px, py = point
+    ax, ay = a
+    bx, by = b
+
+    return (
+        (bx - ax) * (py - ay)
+        - (by - ay) * (px - ax)
+    )
+
+
+def crossed(
+    prev_point,
+    curr_point,
+    a,
+    b,
+):
+    if prev_point is None or curr_point is None:
+        return False
+
+    s1 = line_side(
+        prev_point,
+        a,
+        b,
+    )
+
+    s2 = line_side(
+        curr_point,
+        a,
+        b,
+    )
+
+    return (
+        (s1 == 0)
+        or (s2 == 0)
+        or ((s1 < 0) != (s2 < 0))
+    )
 
 
 def analyze_video(
-    video_path: str,
-    route: str = "Cihampelas",
-    calibration_distance_m: float = 0.0,
-    line_a_y: float = 0.0,
-    line_b_y: float = 0.0,
+    video_path: Path,
+    route: str,
+    calibration_distance_m: float | None,
+    line_a_y: float | None,
+    line_b_y: float | None,
 ):
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(
-            f"Video tidak ditemukan: {video_path}"
-        )
-
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(
+        str(video_path)
+    )
 
     if not cap.isOpened():
         raise RuntimeError(
-            "Video tidak dapat dibuka."
+            "Video tidak dapat dibuka oleh OpenCV."
         )
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(
+    fps = (
+        cap.get(cv2.CAP_PROP_FPS)
+        or 30.0
+    )
+
+    frame_count = int(
         cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        or 0
     )
 
     width = int(
         cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        or 0
     )
 
     height = int(
         cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        or 0
     )
 
     duration = (
-        total_frames / fps
-        if total_frames > 0
-        else 0
+        frame_count / fps
+        if frame_count > 0 and fps > 0
+        else 0.0
     )
 
-    # -----------------------------------------------------
-    # Counting line otomatis jika belum diatur
-    # -----------------------------------------------------
-
-    count_line_y = (
-        line_a_y
-        if line_a_y > 0
-        else height * 0.50
+    process_fps = max(
+        1.0,
+        min(PROCESS_FPS, fps),
     )
 
-    # -----------------------------------------------------
-    # Tracking data
-    # -----------------------------------------------------
+    stride = max(
+        1,
+        round(fps / process_fps),
+    )
 
-    previous_centers = {}
+    line_a = horizontal_line(
+        line_a_y,
+        width,
+    )
 
-    counted_ids = set()
+    line_b = horizontal_line(
+        line_b_y,
+        width,
+    )
 
-    vehicle_counts = defaultdict(int)
+    speed_distance = float(
+        calibration_distance_m or 0.0
+    )
 
-    line_a_times = {}
-    line_b_times = {}
+    calibrated = bool(
+        speed_distance > 0
+        and line_a is not None
+        and line_b is not None
+        and line_a_y != line_b_y
+    )
 
-    speed_values = []
+    model = get_model()
 
+    counts = defaultdict(int)
+
+    counted_ids: set[int] = set()
+
+    previous_centers: dict[
+        int,
+        tuple[float, float],
+    ] = {}
+
+    line_a_times: dict[
+        int,
+        float,
+    ] = {}
+
+    line_b_times: dict[
+        int,
+        float,
+    ] = {}
+
+    speed_samples: list[float] = []
+
+    timeline = []
+
+    processed = 0
     frame_index = 0
 
-    # -----------------------------------------------------
-    # Pemrosesan video
-    #
-    # Untuk video 4K, frame diperkecil ketika masuk YOLO.
-    # Video asli tetap disimpan sebagai sumber tampilan.
-    # -----------------------------------------------------
-
-    MAX_PROCESS_WIDTH = 1280
+    started = time.time()
 
     while True:
+        ok, frame = cap.read()
 
-        success, frame = cap.read()
-
-        if not success:
+        if not ok:
             break
 
-        current_time = frame_index / fps
+        if frame_index % stride != 0:
+            frame_index += 1
+            continue
 
-        # Resize hanya untuk AI
-        process_frame = frame
+        timestamp = frame_index / fps
 
-        if width > MAX_PROCESS_WIDTH:
-
-            scale = (
-                MAX_PROCESS_WIDTH
-                / float(width)
-            )
-
-            new_height = int(
-                height * scale
-            )
-
-            process_frame = cv2.resize(
-                frame,
-                (
-                    MAX_PROCESS_WIDTH,
-                    new_height,
-                ),
-            )
-
-            process_count_line_y = (
-                count_line_y * scale
-            )
-
-            process_line_a_y = (
-                line_a_y * scale
-                if line_a_y > 0
-                else 0
-            )
-
-            process_line_b_y = (
-                line_b_y * scale
-                if line_b_y > 0
-                else 0
-            )
-
-        else:
-
-            process_count_line_y = count_line_y
-            process_line_a_y = line_a_y
-            process_line_b_y = line_b_y
-
-        # -------------------------------------------------
-        # YOLO + ByteTrack
-        # -------------------------------------------------
-
-        results = MODEL.track(
-            process_frame,
+        results = model.track(
+            source=frame,
             persist=True,
-            tracker="bytetrack.yaml",
-            classes=TRACK_CLASSES,
-            conf=0.25,
-            imgsz=640,
+            tracker=TRACKER,
+            conf=CONF_THRESHOLD,
+            classes=list(
+                TARGET_CLASSES.keys()
+            ),
             verbose=False,
         )
 
-        if not results:
-            frame_index += 1
-            continue
+        r = results[0]
 
-        result = results[0]
+        detections = []
 
-        if result.boxes is None:
-            frame_index += 1
-            continue
-
-        if result.boxes.id is None:
-            frame_index += 1
-            continue
-
-        ids = (
-            result.boxes.id
-            .int()
-            .cpu()
-            .tolist()
-        )
-
-        classes = (
-            result.boxes.cls
-            .int()
-            .cpu()
-            .tolist()
-        )
-
-        boxes = (
-            result.boxes.xyxy
-            .cpu()
-            .tolist()
-        )
-
-        for track_id, class_id, box in zip(
-            ids,
-            classes,
-            boxes,
+        if (
+            r.boxes is not None
+            and len(r.boxes) > 0
         ):
-
-            if class_id not in CLASS_MAP:
-                continue
-
-            label = CLASS_MAP[class_id]
-
-            x1, y1, x2, y2 = box
-
-            center_x = (
-                x1 + x2
-            ) / 2
-
-            center_y = (
-                y1 + y2
-            ) / 2
-
-            previous = previous_centers.get(
-                track_id
+            xyxy = (
+                r.boxes.xyxy
+                .cpu()
+                .numpy()
             )
 
-            if previous is not None:
+            cls = (
+                r.boxes.cls
+                .cpu()
+                .numpy()
+                .astype(int)
+            )
 
-                previous_y = previous[1]
+            conf = (
+                r.boxes.conf
+                .cpu()
+                .numpy()
+            )
 
-                # -----------------------------------------
-                # Counting kendaraan
-                # -----------------------------------------
+            ids = (
+                r.boxes.id
+                .cpu()
+                .numpy()
+                .astype(int)
+                if r.boxes.id is not None
+                else None
+            )
 
-                crossed_count_line = (
-                    previous_y
-                    < process_count_line_y
-                    <= center_y
-                    or
-                    previous_y
-                    > process_count_line_y
-                    >= center_y
+            for i, (
+                box,
+                cls_id,
+                score,
+            ) in enumerate(
+                zip(
+                    xyxy,
+                    cls,
+                    conf,
+                )
+            ):
+                if cls_id not in TARGET_CLASSES:
+                    continue
+
+                track_id = (
+                    int(ids[i])
+                    if ids is not None
+                    else None
+                )
+
+                x1, y1, x2, y2 = map(
+                    float,
+                    box,
+                )
+
+                center = (
+                    (x1 + x2) / 2.0,
+                    (y1 + y2) / 2.0,
+                )
+
+                name = TARGET_CLASSES[
+                    cls_id
+                ]
+
+                detections.append(
+                    {
+                        "x1": round(
+                            x1 / max(width, 1),
+                            5,
+                        ),
+                        "y1": round(
+                            y1 / max(height, 1),
+                            5,
+                        ),
+                        "x2": round(
+                            x2 / max(width, 1),
+                            5,
+                        ),
+                        "y2": round(
+                            y2 / max(height, 1),
+                            5,
+                        ),
+                        "class": name,
+                        "confidence": round(
+                            float(score),
+                            4,
+                        ),
+                        "track_id": track_id,
+                        "time": round(
+                            timestamp,
+                            3,
+                        ),
+                    }
+                )
+
+                if track_id is None:
+                    continue
+
+                prev = previous_centers.get(
+                    track_id
                 )
 
                 if (
-                    crossed_count_line
-                    and track_id not in counted_ids
+                    line_a is not None
+                    and line_b is not None
                 ):
+                    if (
+                        track_id
+                        not in counted_ids
+                        and (
+                            crossed(
+                                prev,
+                                center,
+                                *line_a,
+                            )
+                            or crossed(
+                                prev,
+                                center,
+                                *line_b,
+                            )
+                        )
+                    ):
+                        counted_ids.add(
+                            track_id
+                        )
+                        counts[name] += 1
 
+                elif track_id not in counted_ids:
                     counted_ids.add(
                         track_id
                     )
+                    counts[name] += 1
 
-                    vehicle_counts[label] += 1
-
-                # -----------------------------------------
-                # Line A
-                # -----------------------------------------
-
-                if process_line_a_y > 0:
-
-                    crossed_a = (
-                        previous_y
-                        < process_line_a_y
-                        <= center_y
-                        or
-                        previous_y
-                        > process_line_a_y
-                        >= center_y
-                    )
-
+                if calibrated and prev is not None:
                     if (
-                        crossed_a
+                        crossed(
+                            prev,
+                            center,
+                            *line_a,
+                        )
                         and track_id
                         not in line_a_times
                     ):
-
                         line_a_times[
                             track_id
-                        ] = current_time
-
-                # -----------------------------------------
-                # Line B
-                # -----------------------------------------
-
-                if process_line_b_y > 0:
-
-                    crossed_b = (
-                        previous_y
-                        < process_line_b_y
-                        <= center_y
-                        or
-                        previous_y
-                        > process_line_b_y
-                        >= center_y
-                    )
+                        ] = timestamp
 
                     if (
-                        crossed_b
+                        crossed(
+                            prev,
+                            center,
+                            *line_b,
+                        )
                         and track_id
                         not in line_b_times
                     ):
-
                         line_b_times[
                             track_id
-                        ] = current_time
+                        ] = timestamp
+
+                    if (
+                        track_id
+                        in line_a_times
+                        and track_id
+                        in line_b_times
+                    ):
+                        dt = abs(
+                            line_b_times[
+                                track_id
+                            ]
+                            - line_a_times[
+                                track_id
+                            ]
+                        )
 
                         if (
-                            track_id
-                            in line_a_times
+                            0 < dt <= 60
                         ):
-
-                            delta_t = (
-                                line_b_times[
-                                    track_id
-                                ]
-                                -
-                                line_a_times[
-                                    track_id
-                                ]
-                            )
-
-                            delta_t = abs(
-                                delta_t
+                            speed = (
+                                speed_distance
+                                / dt
                             )
 
                             if (
-                                calibration_distance_m
-                                > 0
-                                and delta_t
-                                > 0
+                                0
+                                < speed
+                                < 60
                             ):
-
-                                speed = (
-                                    calibration_distance_m
-                                    / delta_t
+                                speed_samples.append(
+                                    speed
                                 )
 
-                                if (
-                                    0.1
-                                    <= speed
-                                    <= 40
-                                ):
+                        line_a_times.pop(
+                            track_id,
+                            None,
+                        )
 
-                                    speed_values.append(
-                                        speed
-                                    )
+                        line_b_times.pop(
+                            track_id,
+                            None,
+                        )
 
-            previous_centers[
-                track_id
-            ] = (
-                center_x,
-                center_y,
-            )
+                previous_centers[
+                    track_id
+                ] = center
 
+        timeline.append(
+            {
+                "time": round(
+                    timestamp,
+                    3,
+                ),
+                "detections": detections,
+            }
+        )
+
+        processed += 1
         frame_index += 1
 
     cap.release()
 
-    # =====================================================
-    # HASIL
-    # =====================================================
+    total = int(
+        sum(counts.values())
+    )
 
-    total = len(counted_ids)
+    flow = (
+        total
+        / (duration / 60.0)
+        if duration > 0
+        else None
+    )
 
-    if duration > 0:
-
-        flow_rate = (
-            total
-            / (duration / 60.0)
+    avg_speed = (
+        float(
+            np.mean(speed_samples)
         )
+        if speed_samples
+        else None
+    )
+
+    if flow is None:
+        status = "BELUM TERSEDIA"
+
+    elif flow < 30:
+        status = "RENDAH"
+
+    elif flow < 60:
+        status = "SEDANG"
 
     else:
-
-        flow_rate = 0.0
-
-    if speed_values:
-
-        average_speed = (
-            sum(speed_values)
-            / len(speed_values)
-        )
-
-        speed_status = "terkalibrasi"
-
-    else:
-
-        average_speed = None
-
-        speed_status = "belum terkalibrasi"
-
-    # -----------------------------------------------------
-    # Status lalu lintas
-    # -----------------------------------------------------
-
-    if flow_rate < 15:
-
-        traffic_status = "RENDAH"
-
-    elif flow_rate < 30:
-
-        traffic_status = "SEDANG"
-
-    else:
-
-        traffic_status = "TINGGI"
+        status = "TINGGI"
 
     return {
         "route": route,
 
         "video": {
-            "width": width,
-            "height": height,
-            "fps": round(
-                fps,
-                2,
-            ),
-            "frame_count": total_frames,
             "duration_seconds": round(
                 duration,
-                2,
+                3,
             ),
+            "fps": round(
+                fps,
+                3,
+            ),
+            "analysis_fps": round(
+                process_fps,
+                3,
+            ),
+            "frames": frame_count,
+            "frames_processed": processed,
+            "resolution": {
+                "width": width,
+                "height": height,
+            },
         },
 
         "vehicles": {
             "total": total,
-            "motor": vehicle_counts.get(
-                "motor",
-                0,
+            "motor": int(
+                counts["motor"]
             ),
-            "mobil": vehicle_counts.get(
-                "mobil",
-                0,
+            "mobil": int(
+                counts["mobil"]
             ),
-            "bus": vehicle_counts.get(
-                "bus",
-                0,
+            "bus": int(
+                counts["bus"]
             ),
-            "truk": vehicle_counts.get(
-                "truk",
-                0,
+            "truk": int(
+                counts["truk"]
             ),
-            "sepeda": vehicle_counts.get(
-                "sepeda",
-                0,
+            "sepeda": int(
+                counts["sepeda"]
             ),
         },
 
         "traffic": {
-            "flow_rate_vehicles_per_minute": round(
-                flow_rate,
-                2,
+            "flow_rate_vehicles_per_minute": (
+                round(flow, 3)
+                if flow is not None
+                else None
             ),
-            "status": traffic_status,
+            "status": status,
         },
 
         "speed": {
             "average_speed_mps": (
                 round(
-                    average_speed,
-                    2,
+                    avg_speed,
+                    3,
                 )
-                if average_speed is not None
+                if avg_speed is not None
                 else None
             ),
-            "status": speed_status,
-            "samples": len(
-                speed_values
+            "sample_count": len(
+                speed_samples
             ),
+            "status": (
+                "terkalibrasi"
+                if calibrated
+                else "belum terkalibrasi"
+            ),
+        },
+
+        "queue": {
+            "available": False,
+            "total": None,
+            "status": "belum tersedia",
         },
 
         "calibration": {
-            "line_a_y": (
-                line_a_y
-                if line_a_y > 0
-                else None
-            ),
-            "line_b_y": (
-                line_b_y
-                if line_b_y > 0
-                else None
-            ),
             "distance_m": (
-                calibration_distance_m
-                if calibration_distance_m > 0
+                speed_distance
+                if speed_distance > 0
                 else None
+            ),
+            "line_a_y": line_a_y,
+            "line_b_y": line_b_y,
+            "speed_calibrated": calibrated,
+            "counting_line_configured": bool(
+                line_a is not None
+                and line_b is not None
             ),
         },
 
-        "method": {
-            "source": "video asli",
-            "detection": "YOLO",
-            "tracking": "ByteTrack",
-            "random_data": False,
-        },
+        "detections_timeline": timeline,
+
+        "analysis_runtime_seconds": round(
+            time.time() - started,
+            3,
+        ),
+
+        "model": MODEL_NAME,
+
+        "tracker": TRACKER,
+
+        "confidence_threshold": (
+            CONF_THRESHOLD
+        ),
+
+        "source": "video asli",
+
+        "random_data": False,
     }
