@@ -1,59 +1,43 @@
 import os
 import shutil
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Thread
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .analysis import analyze_video
 
 
-# =========================================================
-# APP
-# =========================================================
+BASE_DIR = Path(__file__).resolve().parent.parent
+MEDIA_DIR = BASE_DIR / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "150"))
+MAX_WORKERS = max(1, int(os.getenv("MAX_ANALYSIS_WORKERS", "1")))
 
 app = FastAPI(
     title="Integrated Cihampelas Mobility AI Backend",
-    description=(
-        "Backend analisis video lalu lintas "
-        "Jalan Cihampelas dan Jalan Cipaganti."
-    ),
     version="0.2.0",
 )
 
-
-# =========================================================
-# CORS
-# =========================================================
+origins = [
+    x.strip()
+    for x in os.getenv("CORS_ORIGINS", "*").split(",")
+    if x.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=origins or ["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# =========================================================
-# FOLDER
-# =========================================================
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-MEDIA_DIR = BASE_DIR / "media"
-UPLOAD_DIR = MEDIA_DIR / "uploads"
-
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# =========================================================
-# STATIC MEDIA
-# =========================================================
 
 app.mount(
     "/media",
@@ -61,213 +45,237 @@ app.mount(
     name="media",
 )
 
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# =========================================================
-# JOB STORAGE
-#
-# Untuk prototype:
-# status disimpan di memory.
-# =========================================================
-
-JOBS = {}
+jobs: dict[str, dict[str, Any]] = {}
+jobs_lock = threading.Lock()
 
 
-# =========================================================
-# BACKGROUND ANALYSIS
-# =========================================================
+def set_job(job_id: str, **updates: Any) -> None:
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(updates)
 
-def run_analysis_job(
+
+def run_job(
     job_id: str,
-    video_path: str,
+    input_path: Path,
     route: str,
-    calibration_distance_m: float,
-    line_a_y: float,
-    line_b_y: float,
-):
+    config: dict[str, Any],
+    source_url: str,
+) -> None:
+    set_job(
+        job_id,
+        status="processing",
+        message="AI sedang memproses video.",
+    )
+
     try:
-
-        JOBS[job_id]["status"] = "processing"
-
         result = analyze_video(
-            video_path=video_path,
+            video_path=input_path,
             route=route,
-            calibration_distance_m=calibration_distance_m,
-            line_a_y=line_a_y,
-            line_b_y=line_b_y,
-        )
-
-        filename = Path(video_path).name
-
-        result["video_url"] = (
-            f"/media/uploads/{filename}"
+            calibration_distance_m=config.get("calibration_distance_m"),
+            line_a_y=config.get("line_a_y"),
+            line_b_y=config.get("line_b_y"),
         )
 
         result["job_id"] = job_id
+        result["source_video_url"] = source_url
+        result["video_url"] = source_url
 
-        JOBS[job_id]["status"] = "completed"
-        JOBS[job_id]["result"] = result
+        set_job(
+            job_id,
+            status="completed",
+            message="Analisis selesai.",
+            result=result,
+        )
 
     except Exception as exc:
+        set_job(
+            job_id,
+            status="failed",
+            message="Analisis gagal.",
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
-        JOBS[job_id]["status"] = "failed"
 
-        JOBS[job_id]["error"] = str(exc)
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    executor.shutdown(
+        wait=False,
+        cancel_futures=True,
+    )
 
-
-# =========================================================
-# ROOT
-# =========================================================
 
 @app.get("/")
 def root():
+    with jobs_lock:
+        count = len(jobs)
+
     return {
         "status": "online",
         "service": "Integrated Cihampelas Mobility AI Backend",
         "version": "0.2.0",
+        "jobs": count,
     }
 
-
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.get("/health")
 def health():
+    with jobs_lock:
+        counts = {
+            "queued": 0,
+            "processing": 0,
+            "completed": 0,
+            "failed": 0,
+        }
+
+        for job in jobs.values():
+            status = job.get("status")
+            if status in counts:
+                counts[status] += 1
+
     return {
         "status": "healthy",
-        "jobs": len(JOBS),
+        "jobs": len(jobs),
+        **counts,
     }
 
-
-# =========================================================
-# DEMO
-# =========================================================
-
-@app.get("/demo")
-def demo():
-
-    demo_file = BASE_DIR / "app" / "demo.html"
-
-    if not demo_file.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="demo.html tidak ditemukan.",
-        )
-
-    return FileResponse(
-        str(demo_file)
-    )
-
-
-# =========================================================
-# START ANALYSIS JOB
-# =========================================================
 
 @app.post("/analyze")
 async def analyze(
     video: UploadFile = File(...),
     route: str = Form("Cihampelas"),
-    calibration_distance_m: float = Form(0.0),
-    line_a_y: float = Form(0.0),
-    line_b_y: float = Form(0.0),
+    calibration_distance_m: str = Form(""),
+    line_a_y: str = Form(""),
+    line_b_y: str = Form(""),
 ):
-
     if not video.filename:
         raise HTTPException(
-            status_code=400,
-            detail="Nama file video tidak tersedia.",
+            400,
+            "Nama file video tidak tersedia.",
         )
 
-    allowed_extensions = {
+    suffix = Path(video.filename).suffix.lower()
+
+    allowed = {
         ".mp4",
-        ".avi",
         ".mov",
+        ".avi",
         ".mkv",
         ".webm",
+        ".m4v",
     }
 
-    suffix = Path(
-        video.filename
-    ).suffix.lower()
-
-    if suffix not in allowed_extensions:
+    if suffix not in allowed:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Format video tidak didukung. "
-                "Gunakan MP4, AVI, MOV, MKV, atau WEBM."
-            ),
+            400,
+            f"Format video tidak didukung: {sorted(allowed)}",
         )
 
-    # -----------------------------------------------------
-    # JOB ID
-    # -----------------------------------------------------
+    def parse_float(raw: str | None) -> float | None:
+        value = (raw or "").strip()
+
+        if not value:
+            return None
+
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise HTTPException(
+                422,
+                f"Nilai numerik tidak valid: {raw}",
+            ) from exc
+
+    distance = parse_float(calibration_distance_m)
+    line_a = parse_float(line_a_y)
+    line_b = parse_float(line_b_y)
 
     job_id = str(uuid.uuid4())
 
-    filename = (
-        f"{job_id}{suffix}"
+    job_dir = MEDIA_DIR / job_id
+    job_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    saved_path = (
-        UPLOAD_DIR / filename
-    )
+    input_path = job_dir / f"source{suffix}"
+    source_url = f"/media/{job_id}/source{suffix}"
 
-    # -----------------------------------------------------
-    # SIMPAN VIDEO
-    # -----------------------------------------------------
+    total = 0
 
     try:
+        with input_path.open("wb") as out:
+            while True:
+                chunk = await video.read(1024 * 1024)
 
-        with saved_path.open("wb") as buffer:
+                if not chunk:
+                    break
 
-            shutil.copyfileobj(
-                video.file,
-                buffer,
-            )
+                total += len(chunk)
+
+                if total > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(
+                        413,
+                        f"Video melebihi batas {MAX_UPLOAD_MB} MB.",
+                    )
+
+                out.write(chunk)
+
+    except HTTPException:
+        shutil.rmtree(
+            job_dir,
+            ignore_errors=True,
+        )
+        raise
 
     except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Gagal menyimpan video: {exc}"
-            ),
+        shutil.rmtree(
+            job_dir,
+            ignore_errors=True,
         )
 
-    # -----------------------------------------------------
-    # DAFTARKAN JOB
-    # -----------------------------------------------------
+        raise HTTPException(
+            500,
+            f"Upload video gagal: {type(exc).__name__}: {exc}",
+        ) from exc
 
-    JOBS[job_id] = {
-        "status": "queued",
-        "result": None,
-        "error": None,
-        "route": route,
+    config = {
+        "calibration_distance_m": distance,
+        "line_a_y": line_a,
+        "line_b_y": line_b,
     }
 
-    # -----------------------------------------------------
-    # JALANKAN ANALISIS DI BACKGROUND
-    # -----------------------------------------------------
+    with jobs_lock:
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "message": (
+                "Video berhasil diunggah. "
+                "Analisis AI sedang diproses."
+            ),
+            "source_filename": video.filename,
+        }
 
-    thread = Thread(
-        target=run_analysis_job,
-        args=(
+    try:
+        executor.submit(
+            run_job,
             job_id,
-            str(saved_path),
+            input_path,
             route,
-            calibration_distance_m,
-            line_a_y,
-            line_b_y,
-        ),
-        daemon=True,
-    )
+            config,
+            source_url,
+        )
 
-    thread.start()
-
-    # -----------------------------------------------------
-    # LANGSUNG KEMBALIKAN JOB ID
-    # -----------------------------------------------------
+    except Exception as exc:
+        set_job(
+            job_id,
+            status="failed",
+            error=(
+                f"Queue gagal: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
 
     return {
         "job_id": job_id,
@@ -279,34 +287,15 @@ async def analyze(
     }
 
 
-# =========================================================
-# CHECK JOB STATUS
-# =========================================================
-
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
 
-    if job_id not in JOBS:
+        if job is None:
+            raise HTTPException(
+                404,
+                "Job tidak ditemukan.",
+            )
 
-        raise HTTPException(
-            status_code=404,
-            detail="JOB ID tidak ditemukan.",
-        )
-
-    job = JOBS[job_id]
-
-    response = {
-        "job_id": job_id,
-        "status": job["status"],
-        "route": job["route"],
-    }
-
-    if job["status"] == "completed":
-
-        response["result"] = job["result"]
-
-    if job["status"] == "failed":
-
-        response["error"] = job["error"]
-
-    return response
+        return dict(job)
