@@ -9,39 +9,21 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+MODEL_NAME = os.getenv("MODEL_NAME", "yolo26n.pt")
+PROCESS_FPS = float(os.getenv("PROCESS_FPS", "8"))
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.55"))
 
-MODEL_NAME = os.getenv(
-    "MODEL_NAME",
-    "yolo26n.pt",
-)
+# Naikkan ukuran inferensi agar objek kecil seperti motor lebih mudah terlihat.
+INFER_SIZE = int(os.getenv("INFER_SIZE", "960"))
 
-PROCESS_FPS = float(
-    os.getenv(
-        "PROCESS_FPS",
-        "8",
-    )
-)
+TRACKER = os.getenv("TRACKER", "bytetrack.yaml")
 
-CONF_THRESHOLD = float(
-    os.getenv(
-        "CONF_THRESHOLD",
-        "0.55",
-    )
-)
-
-TRACKER = os.getenv(
-    "TRACKER",
-    "bytetrack.yaml",
-)
-
-
-# COCO classes:
+# COCO:
 # bicycle = 1
 # car = 2
 # motorcycle = 3
 # bus = 5
 # truck = 7
-
 TARGET_CLASSES = {
     1: "sepeda",
     2: "mobil",
@@ -49,7 +31,6 @@ TARGET_CLASSES = {
     5: "bus",
     7: "truk",
 }
-
 
 MODEL = None
 
@@ -63,10 +44,7 @@ def get_model():
     return MODEL
 
 
-def horizontal_line(
-    y: float | None,
-    width: int,
-):
+def horizontal_line(y: float | None, width: int):
     if y is None:
         return None
 
@@ -78,41 +56,20 @@ def horizontal_line(
     )
 
 
-def line_side(
-    point,
-    a,
-    b,
-):
+def line_side(point, a, b):
     px, py = point
     ax, ay = a
     bx, by = b
 
-    return (
-        (bx - ax) * (py - ay)
-        - (by - ay) * (px - ax)
-    )
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
 
 
-def crossed(
-    prev_point,
-    curr_point,
-    a,
-    b,
-):
+def crossed(prev_point, curr_point, a, b):
     if prev_point is None or curr_point is None:
         return False
 
-    s1 = line_side(
-        prev_point,
-        a,
-        b,
-    )
-
-    s2 = line_side(
-        curr_point,
-        a,
-        b,
-    )
+    s1 = line_side(prev_point, a, b)
+    s2 = line_side(curr_point, a, b)
 
     return (
         (s1 == 0)
@@ -128,34 +85,15 @@ def analyze_video(
     line_a_y: float | None,
     line_b_y: float | None,
 ):
-    cap = cv2.VideoCapture(
-        str(video_path)
-    )
+    cap = cv2.VideoCapture(str(video_path))
 
     if not cap.isOpened():
-        raise RuntimeError(
-            "Video tidak dapat dibuka oleh OpenCV."
-        )
+        raise RuntimeError("Video tidak dapat dibuka oleh OpenCV.")
 
-    fps = (
-        cap.get(cv2.CAP_PROP_FPS)
-        or 30.0
-    )
-
-    frame_count = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        or 0
-    )
-
-    width = int(
-        cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        or 0
-    )
-
-    height = int(
-        cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        or 0
-    )
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
     duration = (
         frame_count / fps
@@ -173,15 +111,8 @@ def analyze_video(
         round(fps / process_fps),
     )
 
-    line_a = horizontal_line(
-        line_a_y,
-        width,
-    )
-
-    line_b = horizontal_line(
-        line_b_y,
-        width,
-    )
+    line_a = horizontal_line(line_a_y, width)
+    line_b = horizontal_line(line_b_y, width)
 
     speed_distance = float(
         calibration_distance_m or 0.0
@@ -202,18 +133,11 @@ def analyze_video(
 
     previous_centers: dict[
         int,
-        tuple[float, float],
+        tuple[float, float]
     ] = {}
 
-    line_a_times: dict[
-        int,
-        float,
-    ] = {}
-
-    line_b_times: dict[
-        int,
-        float,
-    ] = {}
+    line_a_times: dict[int, float] = {}
+    line_b_times: dict[int, float] = {}
 
     speed_samples: list[float] = []
 
@@ -230,6 +154,7 @@ def analyze_video(
         if not ok:
             break
 
+        # Sampling frame untuk mengurangi beban pemrosesan.
         if frame_index % stride != 0:
             frame_index += 1
             continue
@@ -241,9 +166,9 @@ def analyze_video(
             persist=True,
             tracker=TRACKER,
             conf=CONF_THRESHOLD,
-            classes=list(
-                TARGET_CLASSES.keys()
-            ),
+            imgsz=INFER_SIZE,
+            max_det=100,
+            classes=list(TARGET_CLASSES.keys()),
             verbose=False,
         )
 
@@ -251,15 +176,8 @@ def analyze_video(
 
         detections = []
 
-        if (
-            r.boxes is not None
-            and len(r.boxes) > 0
-        ):
-            xyxy = (
-                r.boxes.xyxy
-                .cpu()
-                .numpy()
-            )
+        if r.boxes is not None and len(r.boxes) > 0:
+            xyxy = r.boxes.xyxy.cpu().numpy()
 
             cls = (
                 r.boxes.cls
@@ -275,10 +193,7 @@ def analyze_video(
             )
 
             ids = (
-                r.boxes.id
-                .cpu()
-                .numpy()
-                .astype(int)
+                r.boxes.id.cpu().numpy().astype(int)
                 if r.boxes.id is not None
                 else None
             )
@@ -288,11 +203,7 @@ def analyze_video(
                 cls_id,
                 score,
             ) in enumerate(
-                zip(
-                    xyxy,
-                    cls,
-                    conf,
-                )
+                zip(xyxy, cls, conf)
             ):
                 if cls_id not in TARGET_CLASSES:
                     continue
@@ -313,10 +224,11 @@ def analyze_video(
                     (y1 + y2) / 2.0,
                 )
 
-                name = TARGET_CLASSES[
-                    cls_id
-                ]
+                name = TARGET_CLASSES[cls_id]
 
+                # Simpan bbox dalam bentuk NORMALIZED 0..1
+                # supaya frontend mudah menampilkannya
+                # pada ukuran video apa pun.
                 detections.append(
                     {
                         "x1": round(
@@ -348,6 +260,10 @@ def analyze_video(
                     }
                 )
 
+                # -------------------------------------------------
+                # COUNTING
+                # -------------------------------------------------
+
                 if track_id is None:
                     continue
 
@@ -359,9 +275,10 @@ def analyze_video(
                     line_a is not None
                     and line_b is not None
                 ):
+                    # Kendaraan dihitung ketika tracker
+                    # melewati salah satu garis.
                     if (
-                        track_id
-                        not in counted_ids
+                        track_id not in counted_ids
                         and (
                             crossed(
                                 prev,
@@ -375,72 +292,64 @@ def analyze_video(
                             )
                         )
                     ):
-                        counted_ids.add(
-                            track_id
-                        )
+                        counted_ids.add(track_id)
                         counts[name] += 1
 
-                elif track_id not in counted_ids:
-                    counted_ids.add(
-                        track_id
-                    )
-                    counts[name] += 1
+                else:
+                    # Bila garis belum tersedia,
+                    # satu track unik tetap dihitung sekali.
+                    if track_id not in counted_ids:
+                        counted_ids.add(track_id)
+                        counts[name] += 1
+
+                # -------------------------------------------------
+                # SPEED
+                # -------------------------------------------------
 
                 if calibrated and prev is not None:
-                    if (
-                        crossed(
-                            prev,
-                            center,
-                            *line_a,
-                        )
-                        and track_id
-                        not in line_a_times
-                    ):
-                        line_a_times[
-                            track_id
-                        ] = timestamp
+                    crossed_a = crossed(
+                        prev,
+                        center,
+                        *line_a,
+                    )
+
+                    crossed_b = crossed(
+                        prev,
+                        center,
+                        *line_b,
+                    )
 
                     if (
-                        crossed(
-                            prev,
-                            center,
-                            *line_b,
-                        )
-                        and track_id
-                        not in line_b_times
+                        crossed_a
+                        and track_id not in line_a_times
                     ):
-                        line_b_times[
-                            track_id
-                        ] = timestamp
+                        line_a_times[track_id] = (
+                            timestamp
+                        )
 
                     if (
-                        track_id
-                        in line_a_times
-                        and track_id
-                        in line_b_times
+                        crossed_b
+                        and track_id not in line_b_times
+                    ):
+                        line_b_times[track_id] = (
+                            timestamp
+                        )
+
+                    if (
+                        track_id in line_a_times
+                        and track_id in line_b_times
                     ):
                         dt = abs(
-                            line_b_times[
-                                track_id
-                            ]
-                            - line_a_times[
-                                track_id
-                            ]
+                            line_b_times[track_id]
+                            - line_a_times[track_id]
                         )
 
-                        if (
-                            0 < dt <= 60
-                        ):
+                        if 0 < dt <= 60:
                             speed = (
-                                speed_distance
-                                / dt
+                                speed_distance / dt
                             )
 
-                            if (
-                                0
-                                < speed
-                                < 60
-                            ):
+                            if 0 < speed < 60:
                                 speed_samples.append(
                                     speed
                                 )
@@ -455,16 +364,15 @@ def analyze_video(
                             None,
                         )
 
-                previous_centers[
-                    track_id
-                ] = center
+                previous_centers[track_id] = center
+
+        # ---------------------------------------------------------
+        # TIMELINE UNTUK FRONTEND BOUNDING BOX
+        # ---------------------------------------------------------
 
         timeline.append(
             {
-                "time": round(
-                    timestamp,
-                    3,
-                ),
+                "time": round(timestamp, 3),
                 "detections": detections,
             }
         )
@@ -474,34 +382,32 @@ def analyze_video(
 
     cap.release()
 
+    # -------------------------------------------------------------
+    # FINAL METRICS
+    # -------------------------------------------------------------
+
     total = int(
         sum(counts.values())
     )
 
     flow = (
-        total
-        / (duration / 60.0)
+        total / (duration / 60.0)
         if duration > 0
         else None
     )
 
     avg_speed = (
-        float(
-            np.mean(speed_samples)
-        )
+        float(np.mean(speed_samples))
         if speed_samples
         else None
     )
 
     if flow is None:
         status = "BELUM TERSEDIA"
-
     elif flow < 30:
         status = "RENDAH"
-
     elif flow < 60:
         status = "SEDANG"
-
     else:
         status = "TINGGI"
 
@@ -559,10 +465,7 @@ def analyze_video(
 
         "speed": {
             "average_speed_mps": (
-                round(
-                    avg_speed,
-                    3,
-                )
+                round(avg_speed, 3)
                 if avg_speed is not None
                 else None
             ),
@@ -597,6 +500,8 @@ def analyze_video(
             ),
         },
 
+        # Data ini yang nanti dipakai Canva
+        # untuk menggambar bounding box.
         "detections_timeline": timeline,
 
         "analysis_runtime_seconds": round(
@@ -605,14 +510,10 @@ def analyze_video(
         ),
 
         "model": MODEL_NAME,
-
         "tracker": TRACKER,
-
-        "confidence_threshold": (
-            CONF_THRESHOLD
-        ),
+        "confidence_threshold": CONF_THRESHOLD,
+        "inference_image_size": INFER_SIZE,
 
         "source": "video asli",
-
         "random_data": False,
     }
