@@ -254,8 +254,8 @@ def analyze_video(
 
     previous_centers = {}
 
-    # Simpan semua observasi kelas untuk setiap unique track ID.
-    # Line A/B TIDAK menjadi syarat counting; hanya dipakai untuk speed.
+    # Setiap track ID mewakili satu kendaraan yang dihitung satu kali.
+    # Line A/B hanya digunakan untuk crossing dan perhitungan kecepatan.
     track_class_votes = defaultdict(lambda: defaultdict(int))
 
     line_a_times = {}
@@ -598,11 +598,18 @@ def analyze_video(
                 )
 
                 # =================================================
-                # COUNTING
+                # COUNTING BERDASARKAN UNIQUE TRACK ID
                 # =================================================
-                # Setiap unique track ID dihitung satu kali.
-                # Line A/B hanya dipakai untuk menghitung kecepatan.
-                track_class_votes[track_id][class_name] += 1
+                # Jangan tunggu kendaraan melewati Line A/B.
+                # Line A/B hanya untuk crossing dan speed.
+                # Simpan suara kelas untuk setiap track agar perubahan
+                # label sesaat tidak membuat satu kendaraan dihitung
+                # sebagai dua kelas.
+                track_class_votes[
+                    track_id
+                ][
+                    class_name
+                ] += 1
 
                 # =================================================
                 # SPEED
@@ -719,19 +726,20 @@ def analyze_video(
     # ============================================================
     # FINAL UNIQUE TRACK COUNTER
     # ============================================================
-    # Tentukan satu kelas untuk setiap track berdasarkan kelas
-    # yang paling sering terdeteksi pada track tersebut.
+
     counted_classes = defaultdict(int)
 
-    for track_id, class_votes in track_class_votes.items():
-        if not class_votes:
+    for track_id, votes in track_class_votes.items():
+        if not votes:
             continue
 
-        final_class = max(
-            class_votes,
-            key=class_votes.get,
-        )
-        counted_classes[final_class] += 1
+        # Ambil kelas yang paling sering terlihat pada track tersebut.
+        best_class = max(
+            votes.items(),
+            key=lambda item: item[1],
+        )[0]
+
+        counted_classes[best_class] += 1
 
     # ============================================================
     # FINAL METRICS
@@ -852,6 +860,8 @@ def analyze_video(
 
         # Ini untuk membedakan:
         # detector menemukan motor atau tidak.
+        "unique_track_count": int(len(track_class_votes)),
+
         "raw_detection_counts": {
             "motor": int(
                 raw_detection_counts[
