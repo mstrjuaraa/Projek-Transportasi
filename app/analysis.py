@@ -329,18 +329,32 @@ def analyze_video(
         # YOLO + BYTE TRACK
         # ----------------------------------------------------
 
-        results = model.track(
-            source=frame,
-            persist=True,
-            tracker=TRACKER,
-            conf=CONF_THRESHOLD,
-            imgsz=INFER_SIZE,
-            max_det=100,
-            classes=list(
-                TARGET_CLASSES.keys()
-            ),
-            verbose=False,
-        )
+        # ========================================================
+# UPSCALE FRAME UNTUK OBJEK KECIL
+# ========================================================
+
+scale = 2.0
+
+upscaled_frame = cv2.resize(
+    frame,
+    None,
+    fx=scale,
+    fy=scale,
+    interpolation=cv2.INTER_CUBIC,
+)
+
+results = model.track(
+    source=upscaled_frame,
+    persist=True,
+    tracker=TRACKER,
+    conf=CONF_THRESHOLD,
+    imgsz=INFER_SIZE,
+    max_det=100,
+    classes=list(
+        TARGET_CLASSES.keys()
+    ),
+    verbose=False,
+)
 
         result = results[0]
 
@@ -417,10 +431,11 @@ def analyze_video(
                 # BBOX
                 # -----------------------------
 
-                x1, y1, x2, y2 = map(
-                    float,
-                    box,
-                )
+               # Kembalikan koordinat bbox ke ukuran frame asli
+x1, y1, x2, y2 = map(
+    float,
+    box / scale,
+)
 
                 center = (
                     (x1 + x2) / 2.0,
