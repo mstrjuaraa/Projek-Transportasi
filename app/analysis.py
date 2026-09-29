@@ -16,13 +16,38 @@ from ultralytics import YOLO
 
 MODEL_NAME = os.getenv(
     "MODEL_NAME",
-    "yolo26s.pt",
+    "yolo26m.pt",
 )
 
 PROCESS_FPS = float(
     os.getenv(
         "PROCESS_FPS",
-        "8",
+        "12",
+    )
+)
+
+# Confidence minimum for the detector/tracker pass.
+# We run YOLO/ByteTrack at a lower threshold so small motorcycles
+# have a better chance to enter the tracker. Per-class filtering below
+# keeps the final counting threshold stricter for non-motor classes.
+TRACK_CONF_THRESHOLD = float(
+    os.getenv(
+        "TRACK_CONF_THRESHOLD",
+        "0.30",
+    )
+)
+
+MOTOR_MIN_CONF = float(
+    os.getenv(
+        "MOTOR_MIN_CONF",
+        "0.30",
+    )
+)
+
+OTHER_MIN_CONF = float(
+    os.getenv(
+        "OTHER_MIN_CONF",
+        "0.55",
     )
 )
 
@@ -284,6 +309,8 @@ def analyze_video(
         "sepeda": 0,
     }
 
+    motor_debug = []
+
     # --------------------------------------------------------
     # TIMELINE UNTUK FRONTEND
     # --------------------------------------------------------
@@ -326,7 +353,7 @@ def analyze_video(
             source=frame,
             persist=True,
             tracker=TRACKER,
-            conf=CONF_THRESHOLD,
+            conf=TRACK_CONF_THRESHOLD,
             imgsz=INFER_SIZE,
             max_det=100,
             classes=list(
@@ -404,12 +431,33 @@ def analyze_video(
                 ]
 
                 # -------------------------------------------------
-                # RAW DETECTION COUNTER
+                # CLASS-SPECIFIC CONFIDENCE FILTER
+                # -------------------------------------------------
+                # Motor dibuat lebih permisif karena pada CCTV kendaraan
+                # kecil sering mendapat confidence lebih rendah.
+                min_conf = (
+                    MOTOR_MIN_CONF
+                    if class_name == "motor"
+                    else OTHER_MIN_CONF
+                )
+
+                if float(confidence) < min_conf:
+                    continue
+
+                # -------------------------------------------------
+                # RAW/ACCEPTED DETECTION COUNTER
+                # -------------------------------------------------
                 # -------------------------------------------------
 
                 raw_detection_counts[
                     class_name
                 ] += 1
+
+                if class_name == "motor":
+                    motor_debug.append({
+                        "time": round(timestamp, 3),
+                        "confidence": round(float(confidence), 4),
+                    })
 
                 # -------------------------------------------------
                 # BBOX
@@ -862,6 +910,12 @@ def analyze_video(
         # detector menemukan motor atau tidak.
         "unique_track_count": int(len(track_class_votes)),
 
+        "motor_debug": {
+            "accepted_detection_count": len(motor_debug),
+            "min_confidence": MOTOR_MIN_CONF,
+            "detections": motor_debug[:100],
+        },
+
         "raw_detection_counts": {
             "motor": int(
                 raw_detection_counts[
@@ -967,6 +1021,10 @@ def analyze_video(
         "confidence_threshold": (
             CONF_THRESHOLD
         ),
+
+        "tracker_confidence_threshold": TRACK_CONF_THRESHOLD,
+        "motor_min_confidence": MOTOR_MIN_CONF,
+        "other_min_confidence": OTHER_MIN_CONF,
 
         "inference_image_size": (
             INFER_SIZE
