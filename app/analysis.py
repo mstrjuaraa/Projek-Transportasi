@@ -11,7 +11,7 @@ from ultralytics import YOLO
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 MODEL_NAME = os.getenv(
@@ -33,8 +33,6 @@ CONF_THRESHOLD = float(
     )
 )
 
-# Ukuran inferensi diperbesar supaya kendaraan kecil
-# seperti motor lebih mudah terdeteksi.
 INFER_SIZE = int(
     os.getenv(
         "INFER_SIZE",
@@ -49,16 +47,8 @@ TRACKER = os.getenv(
 
 
 # ============================================================
-# COCO CLASS MAPPING
+# COCO VEHICLE CLASSES
 # ============================================================
-#
-# COCO:
-# 1 = bicycle
-# 2 = car
-# 3 = motorcycle
-# 5 = bus
-# 7 = truck
-#
 
 TARGET_CLASSES = {
     1: "sepeda",
@@ -69,7 +59,10 @@ TARGET_CLASSES = {
 }
 
 
-# Model dibuat sekali dan dipakai kembali.
+# ============================================================
+# MODEL
+# ============================================================
+
 MODEL = None
 
 
@@ -93,11 +86,9 @@ def horizontal_line(
     if y is None:
         return None
 
-    y = float(y)
-
     return (
-        (0.0, y),
-        (float(width), y),
+        (0.0, float(y)),
+        (float(width), float(y)),
     )
 
 
@@ -117,38 +108,41 @@ def line_side(
 
 
 def crossed(
-    prev_point,
-    curr_point,
+    previous_point,
+    current_point,
     a,
     b,
 ):
     if (
-        prev_point is None
-        or curr_point is None
+        previous_point is None
+        or current_point is None
     ):
         return False
 
-    s1 = line_side(
-        prev_point,
+    side_previous = line_side(
+        previous_point,
         a,
         b,
     )
 
-    s2 = line_side(
-        curr_point,
+    side_current = line_side(
+        current_point,
         a,
         b,
     )
 
     return (
-        (s1 == 0)
-        or (s2 == 0)
-        or ((s1 < 0) != (s2 < 0))
+        side_previous == 0
+        or side_current == 0
+        or (
+            (side_previous < 0)
+            != (side_current < 0)
+        )
     )
 
 
 # ============================================================
-# MAIN VIDEO ANALYSIS
+# VIDEO ANALYSIS
 # ============================================================
 
 def analyze_video(
@@ -167,9 +161,14 @@ def analyze_video(
             "Video tidak dapat dibuka oleh OpenCV."
         )
 
-    fps = cap.get(
-        cv2.CAP_PROP_FPS
-    ) or 30.0
+    # --------------------------------------------------------
+    # VIDEO METADATA
+    # --------------------------------------------------------
+
+    fps = (
+        cap.get(cv2.CAP_PROP_FPS)
+        or 30.0
+    )
 
     frame_count = int(
         cap.get(
@@ -199,9 +198,9 @@ def analyze_video(
         else 0.0
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # FRAME SAMPLING
-    # ========================================================
+    # --------------------------------------------------------
 
     process_fps = max(
         1.0,
@@ -218,9 +217,9 @@ def analyze_video(
         ),
     )
 
-    # ========================================================
-    # CALIBRATION
-    # ========================================================
+    # --------------------------------------------------------
+    # COUNTING / SPEED LINES
+    # --------------------------------------------------------
 
     line_a = horizontal_line(
         line_a_y,
@@ -232,62 +231,49 @@ def analyze_video(
         width,
     )
 
-    speed_distance = float(
+    distance_m = float(
         calibration_distance_m or 0.0
     )
 
     calibrated = bool(
-        speed_distance > 0
+        distance_m > 0
         and line_a is not None
         and line_b is not None
         and line_a_y != line_b_y
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # MODEL
-    # ========================================================
+    # --------------------------------------------------------
 
     model = get_model()
 
-    # ========================================================
-    # COUNT STORAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # NORMAL TRACK DATA
+    # --------------------------------------------------------
 
-    counts = defaultdict(int)
-
-    # Track ID yang sudah dihitung.
-    counted_ids: set[int] = set()
-
-    # Center terakhir dari setiap track.
     previous_centers = {}
 
-    # ========================================================
-    # MOTOR FALLBACK TRACKING
-    # ========================================================
-    #
-    # Kadang detector menemukan motor tetapi ByteTrack belum
-    # memberikan track_id. Karena itu motor diberi temporary
-    # fallback ID berdasarkan kedekatan posisi antarfame.
-    #
+    counted_ids = set()
+
+    line_a_times = {}
+
+    line_b_times = {}
+
+    speed_samples = []
+
+    # --------------------------------------------------------
+    # FALLBACK MOTOR TRACKING
+    # --------------------------------------------------------
 
     fallback_motor_tracks = {}
 
     next_fallback_motor_id = -1
 
-    # ========================================================
-    # SPEED STORAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # DEBUG RAW DETECTION COUNTS
+    # --------------------------------------------------------
 
-    line_a_times = {}
-    line_b_times = {}
-
-    speed_samples = []
-
-    # ========================================================
-    # DEBUG / DETECTION STORAGE
-    # ========================================================
-
-    # Jumlah raw detection dari YOLO, sebelum counting.
     raw_detection_counts = {
         "motor": 0,
         "mobil": 0,
@@ -296,25 +282,30 @@ def analyze_video(
         "sepeda": 0,
     }
 
-    # Timeline untuk frontend bounding box.
+    # --------------------------------------------------------
+    # TIMELINE UNTUK FRONTEND
+    # --------------------------------------------------------
+
     timeline = []
 
-    processed = 0
+    processed_frames = 0
     frame_index = 0
 
-    started = time.time()
+    started_at = time.time()
 
     # ========================================================
-    # VIDEO LOOP
+    # FRAME LOOP
     # ========================================================
 
     while True:
-        ok, frame = cap.read()
 
-        if not ok:
+        success, frame = cap.read()
+
+        if not success:
             break
 
-        # Sampling frame.
+        # Hanya proses sebagian frame agar CPU tidak terlalu
+        # berat.
         if frame_index % stride != 0:
             frame_index += 1
             continue
@@ -325,56 +316,43 @@ def analyze_video(
             else 0.0
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # YOLO + BYTE TRACK
-        # ----------------------------------------------------
+        # ====================================================
 
-        # ========================================================
-# UPSCALE FRAME UNTUK OBJEK KECIL
-# ========================================================
-
-scale = 2.0
-
-upscaled_frame = cv2.resize(
-    frame,
-    None,
-    fx=scale,
-    fy=scale,
-    interpolation=cv2.INTER_CUBIC,
-)
-
-results = model.track(
-    source=upscaled_frame,
-    persist=True,
-    tracker=TRACKER,
-    conf=CONF_THRESHOLD,
-    imgsz=INFER_SIZE,
-    max_det=100,
-    classes=list(
-        TARGET_CLASSES.keys()
-    ),
-    verbose=False,
-)
+        results = model.track(
+            source=frame,
+            persist=True,
+            tracker=TRACKER,
+            conf=CONF_THRESHOLD,
+            imgsz=INFER_SIZE,
+            max_det=100,
+            classes=list(
+                TARGET_CLASSES.keys()
+            ),
+            verbose=False,
+        )
 
         result = results[0]
 
         detections = []
 
-        # ----------------------------------------------------
-        # RAW BOXES
-        # ----------------------------------------------------
+        # ====================================================
+        # EXTRACT BOXES
+        # ====================================================
 
         if (
             result.boxes is not None
             and len(result.boxes) > 0
         ):
-            xyxy = (
+
+            boxes = (
                 result.boxes.xyxy
                 .cpu()
                 .numpy()
             )
 
-            class_ids = (
+            classes = (
                 result.boxes.cls
                 .cpu()
                 .numpy()
@@ -388,95 +366,95 @@ results = model.track(
             )
 
             if result.boxes.id is not None:
+
                 track_ids = (
                     result.boxes.id
                     .cpu()
                     .numpy()
                     .astype(int)
                 )
+
             else:
+
                 track_ids = None
 
-            # ------------------------------------------------
-            # PROCESS EACH DETECTION
-            # ------------------------------------------------
+            # =================================================
+            # EACH DETECTION
+            # =================================================
 
             for i, (
                 box,
                 class_id,
-                score,
+                confidence,
             ) in enumerate(
                 zip(
-                    xyxy,
-                    class_ids,
+                    boxes,
+                    classes,
                     confidences,
                 )
             ):
+
                 if class_id not in TARGET_CLASSES:
                     continue
 
-                name = TARGET_CLASSES[
+                class_name = TARGET_CLASSES[
                     class_id
                 ]
 
-                # -----------------------------
-                # RAW DETECTION DEBUG COUNTER
-                # -----------------------------
+                # -------------------------------------------------
+                # RAW DETECTION COUNTER
+                # -------------------------------------------------
 
                 raw_detection_counts[
-                    name
+                    class_name
                 ] += 1
 
-                # -----------------------------
+                # -------------------------------------------------
                 # BBOX
-                # -----------------------------
+                # -------------------------------------------------
 
-               # Kembalikan koordinat bbox ke ukuran frame asli
-x1, y1, x2, y2 = map(
-    float,
-    box / scale,
-)
+                x1, y1, x2, y2 = map(
+                    float,
+                    box,
+                )
 
                 center = (
                     (x1 + x2) / 2.0,
                     (y1 + y2) / 2.0,
                 )
 
-                # -----------------------------
+                # -------------------------------------------------
                 # TRACK ID
-                # -----------------------------
+                # -------------------------------------------------
 
                 if track_ids is not None:
+
                     track_id = int(
                         track_ids[i]
                     )
+
                 else:
+
                     track_id = None
 
-                # ==================================================
-                # MOTOR FALLBACK
-                # ==================================================
-                #
-                # Hanya motor yang memakai fallback.
-                #
-                # Tujuannya:
-                # YOLO mendeteksi motor
-                # -> ByteTrack tidak memberi ID
-                # -> motor tetap bisa dilacak sementara
-                #
+                # =================================================
+                # FALLBACK UNTUK MOTOR
+                # =================================================
 
                 if track_id is None:
 
-                    if name == "motor":
+                    if class_name == "motor":
 
-                        # Hapus fallback lama yang sudah
-                        # terlalu jauh tidak terlihat.
+                        # Bersihkan fallback yang terlalu lama.
                         stale_ids = []
 
                         for (
                             fallback_id,
                             state,
-                        ) in fallback_motor_tracks.items():
+                        ) in (
+                            fallback_motor_tracks.items()
+                        ):
+
                             if (
                                 timestamp
                                 - state["last_seen"]
@@ -487,52 +465,58 @@ x1, y1, x2, y2 = map(
                                 )
 
                         for fallback_id in stale_ids:
+
                             fallback_motor_tracks.pop(
                                 fallback_id,
                                 None,
                             )
 
-                        # Cari motor terdekat dari posisi
-                        # motor pada frame sebelumnya.
+                        # Cari motor yang paling dekat
+                        # dengan posisi frame sebelumnya.
                         best_id = None
+
                         best_distance = 100.0
 
                         for (
                             fallback_id,
                             state,
-                        ) in fallback_motor_tracks.items():
+                        ) in (
+                            fallback_motor_tracks.items()
+                        ):
 
-                            last_center = (
+                            old_center = (
                                 state["center"]
                             )
 
-                            distance_px = (
+                            pixel_distance = (
                                 (
                                     center[0]
-                                    - last_center[0]
+                                    - old_center[0]
                                 )
                                 ** 2
                                 +
                                 (
                                     center[1]
-                                    - last_center[1]
+                                    - old_center[1]
                                 )
                                 ** 2
                             ) ** 0.5
 
                             if (
-                                distance_px
+                                pixel_distance
                                 < best_distance
                             ):
+
                                 best_distance = (
-                                    distance_px
+                                    pixel_distance
                                 )
+
                                 best_id = (
                                     fallback_id
                                 )
 
-                        # Kalau tidak ada motor lama
-                        # yang cukup dekat, buat ID baru.
+                        # Tidak ada motor lama yang dekat:
+                        # buat ID baru.
                         if best_id is None:
 
                             track_id = (
@@ -546,7 +530,6 @@ x1, y1, x2, y2 = map(
                             ] = {
                                 "center": center,
                                 "last_seen": timestamp,
-                                "counted": False,
                             }
 
                         else:
@@ -562,13 +545,14 @@ x1, y1, x2, y2 = map(
                             ]["last_seen"] = timestamp
 
                     else:
-                        # Untuk kelas lain tetap mengikuti
-                        # tracking normal.
+
+                        # Untuk kelas lain, tanpa tracker ID
+                        # jangan dihitung.
                         continue
 
-                # ==================================================
+                # =================================================
                 # SAVE DETECTION
-                # ==================================================
+                # =================================================
 
                 detections.append(
                     {
@@ -588,9 +572,9 @@ x1, y1, x2, y2 = map(
                             y2 / max(height, 1),
                             6,
                         ),
-                        "class": name,
+                        "class": class_name,
                         "confidence": round(
-                            float(score),
+                            float(confidence),
                             4,
                         ),
                         "track_id": track_id,
@@ -601,9 +585,9 @@ x1, y1, x2, y2 = map(
                     }
                 )
 
-                # ==================================================
+                # =================================================
                 # PREVIOUS CENTER
-                # ==================================================
+                # =================================================
 
                 previous_center = (
                     previous_centers.get(
@@ -611,13 +595,9 @@ x1, y1, x2, y2 = map(
                     )
                 )
 
-                # ==================================================
+                # =================================================
                 # COUNTING
-                # ==================================================
-
-                # Kalau Line A dan Line B tersedia,
-                # kendaraan dihitung ketika melewati
-                # salah satu garis.
+                # =================================================
 
                 if (
                     line_a is not None
@@ -649,11 +629,27 @@ x1, y1, x2, y2 = map(
                             track_id
                         )
 
-                        counts[name] += 1
+                        raw_name = class_name
+
+                        counts_value = (
+                            raw_name
+                        )
+
+                        # Counter dictionary dikelola
+                        # terpisah di bawah.
+                        if (
+                            "counted_classes"
+                            not in locals()
+                        ):
+                            counted_classes = (
+                                defaultdict(int)
+                            )
+
+                        counted_classes[
+                            counts_value
+                        ] += 1
 
                 else:
-                    # Bila line belum digunakan,
-                    # hitung track unik sekali.
 
                     if (
                         track_id
@@ -664,11 +660,21 @@ x1, y1, x2, y2 = map(
                             track_id
                         )
 
-                        counts[name] += 1
+                        if (
+                            "counted_classes"
+                            not in locals()
+                        ):
+                            counted_classes = (
+                                defaultdict(int)
+                            )
 
-                # ==================================================
+                        counted_classes[
+                            class_name
+                        ] += 1
+
+                # =================================================
                 # SPEED
-                # ==================================================
+                # =================================================
 
                 if (
                     calibrated
@@ -692,6 +698,7 @@ x1, y1, x2, y2 = map(
                         and track_id
                         not in line_a_times
                     ):
+
                         line_a_times[
                             track_id
                         ] = timestamp
@@ -701,6 +708,7 @@ x1, y1, x2, y2 = map(
                         and track_id
                         not in line_b_times
                     ):
+
                         line_b_times[
                             track_id
                         ] = timestamp
@@ -712,7 +720,7 @@ x1, y1, x2, y2 = map(
                         in line_b_times
                     ):
 
-                        dt = abs(
+                        delta_t = abs(
                             line_b_times[
                                 track_id
                             ]
@@ -724,22 +732,23 @@ x1, y1, x2, y2 = map(
 
                         if (
                             0
-                            < dt
+                            < delta_t
                             <= 60
                         ):
 
-                            speed = (
-                                speed_distance
-                                / dt
+                            speed_mps = (
+                                distance_m
+                                / delta_t
                             )
 
-                            # Hindari hasil ekstrim
-                            # yang tidak masuk akal.
                             if (
-                                0 < speed < 60
+                                0
+                                < speed_mps
+                                < 60
                             ):
+
                                 speed_samples.append(
-                                    speed
+                                    speed_mps
                                 )
 
                         line_a_times.pop(
@@ -752,13 +761,12 @@ x1, y1, x2, y2 = map(
                             None,
                         )
 
-                # Simpan posisi terbaru.
                 previous_centers[
                     track_id
                 ] = center
 
         # ========================================================
-        # TIMELINE
+        # SAVE TIMELINE
         # ========================================================
 
         timeline.append(
@@ -771,10 +779,23 @@ x1, y1, x2, y2 = map(
             }
         )
 
-        processed += 1
+        processed_frames += 1
         frame_index += 1
 
     cap.release()
+
+    # ============================================================
+    # SAFE EMPTY COUNTER
+    # ============================================================
+
+    if (
+        "counted_classes"
+        not in locals()
+    ):
+
+        counted_classes = (
+            defaultdict(int)
+        )
 
     # ============================================================
     # FINAL METRICS
@@ -782,43 +803,53 @@ x1, y1, x2, y2 = map(
 
     total = int(
         sum(
-            counts.values()
+            counted_classes.values()
         )
     )
 
-    flow = (
-        total
-        / (duration / 60.0)
-        if duration > 0
-        else None
-    )
+    if duration > 0:
 
-    average_speed = (
-        float(
+        flow_rate = (
+            total
+            / (duration / 60.0)
+        )
+
+    else:
+
+        flow_rate = None
+
+    if speed_samples:
+
+        average_speed = float(
             np.mean(
                 speed_samples
             )
         )
-        if speed_samples
-        else None
-    )
+
+    else:
+
+        average_speed = None
 
     # ============================================================
     # TRAFFIC STATUS
     # ============================================================
 
-    if flow is None:
+    if flow_rate is None:
+
         traffic_status = (
             "BELUM TERSEDIA"
         )
 
-    elif flow < 30:
+    elif flow_rate < 30:
+
         traffic_status = "RENDAH"
 
-    elif flow < 60:
+    elif flow_rate < 60:
+
         traffic_status = "SEDANG"
 
     else:
+
         traffic_status = "TINGGI"
 
     # ============================================================
@@ -827,10 +858,6 @@ x1, y1, x2, y2 = map(
 
     return {
         "route": route,
-
-        # --------------------------------------------------------
-        # VIDEO
-        # --------------------------------------------------------
 
         "video": {
             "duration_seconds": round(
@@ -846,96 +873,92 @@ x1, y1, x2, y2 = map(
                 3,
             ),
             "frames": frame_count,
-            "frames_processed": processed,
+            "frames_processed": processed_frames,
             "resolution": {
                 "width": width,
                 "height": height,
             },
         },
 
-        # --------------------------------------------------------
-        # VEHICLES
-        # --------------------------------------------------------
-
         "vehicles": {
             "total": total,
 
             "motor": int(
-                counts["motor"]
+                counted_classes[
+                    "motor"
+                ]
             ),
 
             "mobil": int(
-                counts["mobil"]
+                counted_classes[
+                    "mobil"
+                ]
             ),
 
             "bus": int(
-                counts["bus"]
+                counted_classes[
+                    "bus"
+                ]
             ),
 
             "truk": int(
-                counts["truk"]
+                counted_classes[
+                    "truk"
+                ]
             ),
 
             "sepeda": int(
-                counts["sepeda"]
+                counted_classes[
+                    "sepeda"
+                ]
             ),
         },
 
-        # --------------------------------------------------------
-        # RAW YOLO DETECTION DEBUG
-        # --------------------------------------------------------
-        #
-        # Ini sangat penting untuk tes motor.
-        #
-        # Misalnya:
-        # raw motor = 25
-        # counted motor = 0
-        #
-        # berarti YOLO melihat motor tetapi counting gagal.
-        #
-        # Kalau:
-        # raw motor = 0
-        #
-        # berarti YOLO memang tidak mendeteksi motor.
-        #
-
+        # Ini untuk membedakan:
+        # detector menemukan motor atau tidak.
         "raw_detection_counts": {
             "motor": int(
-                raw_detection_counts["motor"]
+                raw_detection_counts[
+                    "motor"
+                ]
             ),
+
             "mobil": int(
-                raw_detection_counts["mobil"]
+                raw_detection_counts[
+                    "mobil"
+                ]
             ),
+
             "bus": int(
-                raw_detection_counts["bus"]
+                raw_detection_counts[
+                    "bus"
+                ]
             ),
+
             "truk": int(
-                raw_detection_counts["truk"]
+                raw_detection_counts[
+                    "truk"
+                ]
             ),
+
             "sepeda": int(
-                raw_detection_counts["sepeda"]
+                raw_detection_counts[
+                    "sepeda"
+                ]
             ),
         },
-
-        # --------------------------------------------------------
-        # TRAFFIC
-        # --------------------------------------------------------
 
         "traffic": {
             "flow_rate_vehicles_per_minute": (
                 round(
-                    flow,
+                    flow_rate,
                     3,
                 )
-                if flow is not None
+                if flow_rate is not None
                 else None
             ),
             "status": traffic_status,
         },
-
-        # --------------------------------------------------------
-        # SPEED
-        # --------------------------------------------------------
 
         "speed": {
             "average_speed_mps": (
@@ -958,24 +981,16 @@ x1, y1, x2, y2 = map(
             ),
         },
 
-        # --------------------------------------------------------
-        # QUEUE
-        # --------------------------------------------------------
-
         "queue": {
             "available": False,
             "total": None,
             "status": "belum tersedia",
         },
 
-        # --------------------------------------------------------
-        # CALIBRATION
-        # --------------------------------------------------------
-
         "calibration": {
             "distance_m": (
-                speed_distance
-                if speed_distance > 0
+                distance_m
+                if distance_m > 0
                 else None
             ),
 
@@ -991,19 +1006,11 @@ x1, y1, x2, y2 = map(
             ),
         },
 
-        # --------------------------------------------------------
-        # BOUNDING BOX TIMELINE
-        # --------------------------------------------------------
-
         "detections_timeline": timeline,
-
-        # --------------------------------------------------------
-        # ANALYSIS INFO
-        # --------------------------------------------------------
 
         "analysis_runtime_seconds": round(
             time.time()
-            - started,
+            - started_at,
             3,
         ),
 
@@ -1011,15 +1018,13 @@ x1, y1, x2, y2 = map(
 
         "tracker": TRACKER,
 
-        "confidence_threshold": CONF_THRESHOLD,
+        "confidence_threshold": (
+            CONF_THRESHOLD
+        ),
 
-        "inference_image_size": INFER_SIZE,
-
-        "process_fps": process_fps,
-
-        # --------------------------------------------------------
-        # PROVENANCE
-        # --------------------------------------------------------
+        "inference_image_size": (
+            INFER_SIZE
+        ),
 
         "source": "video asli",
 
