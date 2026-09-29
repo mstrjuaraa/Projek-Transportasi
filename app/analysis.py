@@ -254,7 +254,9 @@ def analyze_video(
 
     previous_centers = {}
 
-    counted_ids = set()
+    # Simpan semua observasi kelas untuk setiap unique track ID.
+    # Line A/B TIDAK menjadi syarat counting; hanya dipakai untuk speed.
+    track_class_votes = defaultdict(lambda: defaultdict(int))
 
     line_a_times = {}
 
@@ -598,79 +600,9 @@ def analyze_video(
                 # =================================================
                 # COUNTING
                 # =================================================
-
-                if (
-                    line_a is not None
-                    and line_b is not None
-                ):
-
-                    crossed_a = crossed(
-                        previous_center,
-                        center,
-                        *line_a,
-                    )
-
-                    crossed_b = crossed(
-                        previous_center,
-                        center,
-                        *line_b,
-                    )
-
-                    if (
-                        track_id
-                        not in counted_ids
-                        and (
-                            crossed_a
-                            or crossed_b
-                        )
-                    ):
-
-                        counted_ids.add(
-                            track_id
-                        )
-
-                        raw_name = class_name
-
-                        counts_value = (
-                            raw_name
-                        )
-
-                        # Counter dictionary dikelola
-                        # terpisah di bawah.
-                        if (
-                            "counted_classes"
-                            not in locals()
-                        ):
-                            counted_classes = (
-                                defaultdict(int)
-                            )
-
-                        counted_classes[
-                            counts_value
-                        ] += 1
-
-                else:
-
-                    if (
-                        track_id
-                        not in counted_ids
-                    ):
-
-                        counted_ids.add(
-                            track_id
-                        )
-
-                        if (
-                            "counted_classes"
-                            not in locals()
-                        ):
-                            counted_classes = (
-                                defaultdict(int)
-                            )
-
-                        counted_classes[
-                            class_name
-                        ] += 1
+                # Setiap unique track ID dihitung satu kali.
+                # Line A/B hanya dipakai untuk menghitung kecepatan.
+                track_class_votes[track_id][class_name] += 1
 
                 # =================================================
                 # SPEED
@@ -785,17 +717,21 @@ def analyze_video(
     cap.release()
 
     # ============================================================
-    # SAFE EMPTY COUNTER
+    # FINAL UNIQUE TRACK COUNTER
     # ============================================================
+    # Tentukan satu kelas untuk setiap track berdasarkan kelas
+    # yang paling sering terdeteksi pada track tersebut.
+    counted_classes = defaultdict(int)
 
-    if (
-        "counted_classes"
-        not in locals()
-    ):
+    for track_id, class_votes in track_class_votes.items():
+        if not class_votes:
+            continue
 
-        counted_classes = (
-            defaultdict(int)
+        final_class = max(
+            class_votes,
+            key=class_votes.get,
         )
+        counted_classes[final_class] += 1
 
     # ============================================================
     # FINAL METRICS
