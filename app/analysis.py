@@ -1,38 +1,10 @@
-"""
-Analisis lalu lintas: YOLO + ByteTrack, versi STREAMING (generator).
-
-`analyze_video()` sekarang adalah generator. Setiap frame yang diproses
-menghasilkan satu event (dict yang siap di-JSON-kan):
-
-    {"type": "start", ...}   -> sekali di awal (metadata video)
-    {"type": "frame", ...}   -> setiap frame yang diproses (total, kecepatan, status)
-    {"type": "final", ...}   -> sekali di akhir (hasil lengkap, format lama)
-
-Contoh pemakaian dengan FastAPI (NDJSON):
-
-    import json
-    from fastapi.responses import StreamingResponse
-
-    def ndjson(events):
-        for event in events:
-            yield json.dumps(event) + "\\n"
-
-    @app.post("/analyze")
-    def analyze(...):
-        gen = analyze_video(path, route, dist_m, line_a_y, line_b_y, emit_every=2)
-        return StreamingResponse(ndjson(gen), media_type="application/x-ndjson")
-
-Untuk kode lama yang butuh hasil akhir saja: `analyze_video_blocking(...)`.
-"""
-
 from __future__ import annotations
 
 import os
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict, deque
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -42,31 +14,25 @@ from ultralytics import YOLO
 # ============================================================
 # CONFIG
 # ============================================================
-
 MODEL_NAME = os.getenv("MODEL_NAME", "yolo26s.pt")
 PROCESS_FPS = float(os.getenv("PROCESS_FPS", "10"))
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.55"))
 TRACK_CONF_THRESHOLD = float(os.getenv("TRACK_CONF_THRESHOLD", "0.40"))
 MOTOR_MIN_CONF = float(os.getenv("MOTOR_MIN_CONF", "0.40"))
 OTHER_MIN_CONF = float(os.getenv("OTHER_MIN_CONF", "0.55"))
 INFER_SIZE = int(os.getenv("INFER_SIZE", "1280"))
 TRACKER = os.getenv("TRACKER", "bytetrack.yaml")
 
-# Track dianggap kendaraan asli (dan langsung dihitung) setelah terlihat
-# minimal sekian kali pada frame yang diproses. TIDAK ADA syarat gerakan,
-# jadi kendaraan yang berhenti/merayap karena macet tetap terhitung.
-# Pada PROCESS_FPS=10, 3 observasi ~ 0.3 detik.
-MIN_TRACK_OBSERVATIONS = int(os.getenv("MIN_TRACK_OBSERVATIONS", "3"))
+# Counting utama: kendaraan dihitung 1x ketika melewati Line A.
+# Bila Line A tidak diberikan, fallback ke unique tracked IDs.
+COUNT_ON_LINE_A = os.getenv("COUNT_ON_LINE_A", "true").lower() in {"1", "true", "yes"}
 
-# Flow rate baru ditampilkan setelah video berjalan sekian detik,
-# supaya status lalu lintas tidak meloncat-loncat di detik-detik awal.
-MIN_FLOW_WINDOW_SECONDS = float(os.getenv("MIN_FLOW_WINDOW_SECONDS", "5"))
+# Progress stream tiap beberapa frame yang diproses.
+PROGRESS_EVERY_FRAMES = int(os.getenv("PROGRESS_EVERY_FRAMES", "5"))
 
 
 # ============================================================
 # COCO VEHICLE CLASSES
 # ============================================================
-
 TARGET_CLASSES = {
     1: "sepeda",
     2: "mobil",
@@ -75,51 +41,26 @@ TARGET_CLASSES = {
     7: "truk",
 }
 
-CLASS_NAMES = ["motor", "mobil", "bus", "truk", "sepeda"]
-
 
 # ============================================================
 # MODEL
 # ============================================================
-
 MODEL = None
 
 
 def get_model():
     global MODEL
-
     if MODEL is None:
         MODEL = YOLO(MODEL_NAME)
-
     return MODEL
-
-
-def reset_tracker(model) -> None:
-    """
-    Model disimpan global dan model.track(persist=True) menyimpan state
-    tracker antar-panggilan. Tanpa reset, ID dan track dari video sebelumnya
-    "bocor" ke video berikutnya. Panggil ini di awal setiap video.
-
-    Catatan: karena state tracker menempel pada model, satu instance model
-    tidak aman dipakai dua analisis yang berjalan bersamaan. Untuk request
-    paralel gunakan satu instance YOLO per analisis (atau antrian/lock).
-    """
-    predictor = getattr(model, "predictor", None)
-    trackers = getattr(predictor, "trackers", None) if predictor else None
-
-    if trackers:
-        for tracker in trackers:
-            tracker.reset()
 
 
 # ============================================================
 # LINE HELPERS
 # ============================================================
-
 def horizontal_line(y: float | None, width: int):
     if y is None:
         return None
-
     return ((0.0, float(y)), (float(width), float(y)))
 
 
@@ -127,272 +68,145 @@ def line_side(point, a, b):
     px, py = point
     ax, ay = a
     bx, by = b
-
     return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
 
 
 def crossed(previous_point, current_point, a, b):
     if previous_point is None or current_point is None:
         return False
-
-    side_previous = line_side(previous_point, a, b)
-    side_current = line_side(current_point, a, b)
-
-    return (
-        side_previous == 0
-        or side_current == 0
-        or ((side_previous < 0) != (side_current < 0))
-    )
+    prev = line_side(previous_point, a, b)
+    curr = line_side(current_point, a, b)
+    return prev == 0 or curr == 0 or ((prev < 0) != (curr < 0))
 
 
 # ============================================================
-# TRACK STATE + COUNTING (PER FRAME)
+# HELPERS
 # ============================================================
-
-@dataclass
-class TrackState:
-    observations: int = 0
-    class_votes: dict = field(default_factory=lambda: defaultdict(float))
-    counted_class: str | None = None  # None = belum dihitung
-
-    def observe(self, class_name: str, confidence: float) -> None:
-        self.observations += 1
-        # Vote dibobot confidence: label yang yakin lebih berpengaruh
-        # daripada label ragu-ragu sesaat.
-        self.class_votes[class_name] += confidence
-
-    def best_class(self) -> str:
-        return max(self.class_votes.items(), key=lambda kv: kv[1])[0]
+def _empty_classes():
+    return {name: 0 for name in ("motor", "mobil", "bus", "truk", "sepeda")}
 
 
-def update_track_count(state: TrackState, counted_classes: dict) -> bool:
-    """
-    Dipanggil setiap kali sebuah track diamati pada frame ini.
-
-    - Track baru dihitung SEKALI, tepat saat observasinya mencapai
-      MIN_TRACK_OBSERVATIONS (return True = baru dikonfirmasi).
-    - Jika kelas terbaik track berubah setelah dihitung (misal motor->mobil),
-      hitungan dipindah antar kelas; total tidak berubah.
-    - Tidak ada filter gerakan -> kendaraan berhenti tetap terhitung.
-    """
-    if state.observations < MIN_TRACK_OBSERVATIONS:
-        return False
-
-    best = state.best_class()
-
-    if state.counted_class is None:
-        counted_classes[best] += 1
-        state.counted_class = best
-        return True
-
-    if state.counted_class != best:
-        counted_classes[state.counted_class] -= 1
-        counted_classes[best] += 1
-        state.counted_class = best
-
-    return False
+def _mean(values):
+    return float(np.mean(values)) if values else None
 
 
-# ============================================================
-# SNAPSHOT HELPERS (dipakai event "frame" dan "final")
-# ============================================================
-
-def vehicles_snapshot(counted_classes: dict) -> dict:
-    snapshot = {"total": int(sum(counted_classes.values()))}
-
-    for name in CLASS_NAMES:
-        snapshot[name] = int(counted_classes.get(name, 0))
-
-    return snapshot
-
-
-def compute_flow_rate(total: int, elapsed_seconds: float, min_seconds: float):
-    if elapsed_seconds <= 0 or elapsed_seconds < min_seconds:
-        return None
-
-    return total / (elapsed_seconds / 60.0)
-
-
-def traffic_status_from_flow(flow_rate: float | None) -> str:
+def _traffic_status(flow_rate):
     if flow_rate is None:
         return "BELUM TERSEDIA"
-
     if flow_rate < 30:
         return "RENDAH"
-
     if flow_rate < 60:
         return "SEDANG"
-
     return "TINGGI"
 
 
-def traffic_snapshot(total: int, elapsed_seconds: float, min_seconds: float) -> dict:
-    flow_rate = compute_flow_rate(total, elapsed_seconds, min_seconds)
-
+def _make_progress(
+    route: str,
+    timestamp: float,
+    duration: float,
+    counted_classes: Counter,
+    speed_samples: list[float],
+    frame_index: int,
+    processed_frames: int,
+    final: bool = False,
+):
+    total = int(sum(counted_classes.values()))
+    flow_rate = total / (duration / 60.0) if duration > 0 else None
+    average_speed = _mean(speed_samples)
     return {
-        "flow_rate_vehicles_per_minute": (
-            round(flow_rate, 3) if flow_rate is not None else None
-        ),
-        "status": traffic_status_from_flow(flow_rate),
-    }
-
-
-def speed_snapshot(speed_samples: list, calibrated: bool) -> dict:
-    average = float(np.mean(speed_samples)) if speed_samples else None
-
-    return {
-        "average_speed_mps": round(average, 3) if average is not None else None,
-        "average_speed_kmh": round(average * 3.6, 2) if average is not None else None,
-        "sample_count": len(speed_samples),
-        "status": "terkalibrasi" if calibrated else "belum terkalibrasi",
+        "type": "final" if final else "progress",
+        "route": route,
+        "progress": round(min(max(timestamp / duration, 0.0), 1.0), 4) if duration > 0 else None,
+        "frame_index": int(frame_index),
+        "frames_processed": int(processed_frames),
+        "timestamp_seconds": round(timestamp, 3),
+        "vehicles": {
+            "total": total,
+            **{name: int(counted_classes[name]) for name in _empty_classes()},
+        },
+        "traffic": {
+            "flow_rate_vehicles_per_minute": round(flow_rate, 3) if flow_rate is not None else None,
+            "status": _traffic_status(flow_rate),
+        },
+        "speed": {
+            "average_speed_mps": round(average_speed, 3) if average_speed is not None else None,
+            "sample_count": len(speed_samples),
+        },
     }
 
 
 # ============================================================
-# VIDEO ANALYSIS (GENERATOR)
+# STREAMING ANALYSIS
 # ============================================================
-
-def analyze_video(
+def analyze_video_stream(
     video_path: Path,
     route: str,
     calibration_distance_m: float | None,
     line_a_y: float | None,
     line_b_y: float | None,
-    emit_every: int = 1,
-    include_timeline_in_final: bool = False,
-) -> Iterator[dict[str, Any]]:
-    """
-    Generator: yield event "start", lalu event "frame" (setiap `emit_every`
-    frame yang diproses), lalu event "final".
+) -> Iterator[dict]:
+    """Yield JSON-serializable progress snapshots, then one final result.
 
-    emit_every               : 1 = kirim setiap frame yang diproses; 2 = tiap
-                               dua frame, dst. (mengurangi trafik ke frontend)
-    include_timeline_in_final: True = event "final" memuat seluruh
-                               detections_timeline seperti versi lama. Default
-                               False karena detail per-frame sudah dikirim
-                               lewat event "frame" (hemat memori & payload).
+    Counting is performed inside the frame loop. The old end-of-video
+    motion/observation filter is intentionally removed: stationary or slow
+    vehicles are not discarded just because they moved <15 px or appeared
+    for <3 observations.
     """
     cap = cv2.VideoCapture(str(video_path))
-
     if not cap.isOpened():
         raise RuntimeError("Video tidak dapat dibuka oleh OpenCV.")
 
-    # try/finally penting pada generator: kalau klien memutus koneksi,
-    # server memanggil generator.close() -> blok finally tetap berjalan
-    # dan video ter-release.
+    started_at = time.time()
+    model = get_model()
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    duration = frame_count / fps if frame_count > 0 and fps > 0 else 0.0
+
+    process_fps = max(1.0, min(PROCESS_FPS, fps))
+    stride = max(1, round(fps / process_fps))
+
+    line_a = horizontal_line(line_a_y, width)
+    line_b = horizontal_line(line_b_y, width)
+    distance_m = float(calibration_distance_m or 0.0)
+    calibrated = bool(
+        distance_m > 0
+        and line_a is not None
+        and line_b is not None
+        and line_a_y != line_b_y
+    )
+
+    previous_centers: dict[int, tuple[float, float]] = {}
+    track_class_votes: defaultdict[int, Counter] = defaultdict(Counter)
+    counted_track_ids: set[int] = set()
+    line_a_times: dict[int, float] = {}
+    line_b_times: dict[int, float] = {}
+    speed_samples: list[float] = []
+    counted_classes: Counter = Counter()
+    timeline: list[dict] = []
+
+    raw_detection_counts: Counter = Counter()
+    accepted_detection_counts: Counter = Counter()
+
+    processed_frames = 0
+    frame_index = 0
+    last_yield_frame = -1
+
     try:
-        # ----------------------------------------------------
-        # VIDEO METADATA
-        # ----------------------------------------------------
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-
-        duration = frame_count / fps if frame_count > 0 and fps > 0 else 0.0
-
-        # ----------------------------------------------------
-        # FRAME SAMPLING
-        # ----------------------------------------------------
-        process_fps = max(1.0, min(PROCESS_FPS, fps))
-        stride = max(1, round(fps / process_fps))
-
-        # ----------------------------------------------------
-        # LINES / KALIBRASI
-        # ----------------------------------------------------
-        line_a = horizontal_line(line_a_y, width)
-        line_b = horizontal_line(line_b_y, width)
-        distance_m = float(calibration_distance_m or 0.0)
-
-        calibrated = bool(
-            distance_m > 0
-            and line_a is not None
-            and line_b is not None
-            and line_a_y != line_b_y
-        )
-
-        video_info = {
-            "duration_seconds": round(duration, 3),
-            "fps": round(fps, 3),
-            "analysis_fps": round(process_fps, 3),
-            "frames": frame_count,
-            "resolution": {"width": width, "height": height},
-        }
-
-        calibration_info = {
-            "distance_m": distance_m if distance_m > 0 else None,
-            "line_a_y": line_a_y,
-            "line_b_y": line_b_y,
-            "speed_calibrated": calibrated,
-            "counting_line_configured": bool(
-                line_a is not None and line_b is not None
-            ),
-        }
-
-        # ----------------------------------------------------
-        # MODEL
-        # ----------------------------------------------------
-        model = get_model()
-        reset_tracker(model)
-
-        # ----------------------------------------------------
-        # STATE
-        # ----------------------------------------------------
-        tracks: dict[int, TrackState] = {}
-        counted_classes: dict[str, int] = defaultdict(int)
-
-        previous_centers: dict[int, tuple[float, float]] = {}
-        line_a_times: dict[int, float] = {}
-        line_b_times: dict[int, float] = {}
-        speed_samples: list[float] = []
-
-        raw_detection_counts = {name: 0 for name in CLASS_NAMES}
-        timeline: list[dict] = []
-
-        processed_frames = 0
-        frame_index = 0
-        last_timestamp = 0.0
-        emit_every = max(1, int(emit_every))
-        started_at = time.time()
-
-        # ----------------------------------------------------
-        # EVENT: START
-        # ----------------------------------------------------
-        yield {
-            "type": "start",
-            "route": route,
-            "video": video_info,
-            "calibration": calibration_info,
-            "model": MODEL_NAME,
-            "tracker": TRACKER,
-        }
-
-        # ====================================================
-        # FRAME LOOP
-        # ====================================================
         while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-            # Frame yang dilewati cukup di-grab (tanpa decode penuh)
-            # supaya lebih ringan di CPU.
             if frame_index % stride != 0:
-                if not cap.grab():
-                    break
-
                 frame_index += 1
                 continue
 
-            success, frame = cap.read()
-
-            if not success:
-                break
-
             timestamp = frame_index / fps if fps > 0 else 0.0
-            last_timestamp = timestamp
 
-            # ------------------------------------------------
-            # YOLO + BYTETRACK
-            # ------------------------------------------------
-            result = model.track(
+            results = model.track(
                 source=frame,
                 persist=True,
                 tracker=TRACKER,
@@ -401,67 +215,85 @@ def analyze_video(
                 max_det=100,
                 classes=list(TARGET_CLASSES.keys()),
                 verbose=False,
-            )[0]
-
+            )
+            result = results[0]
             detections: list[dict] = []
-            newly_confirmed = 0
-            boxes = result.boxes
 
-            if boxes is not None and len(boxes) > 0:
-                xyxy = boxes.xyxy.cpu().numpy()
-                class_ids = boxes.cls.cpu().numpy().astype(int)
-                confidences = boxes.conf.cpu().numpy()
+            if result.boxes is not None and len(result.boxes) > 0:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confidences = result.boxes.conf.cpu().numpy()
 
-                if boxes.id is not None:
-                    track_ids = boxes.id.cpu().numpy().astype(int)
+                if result.boxes.id is not None:
+                    track_ids = result.boxes.id.cpu().numpy().astype(int)
                 else:
-                    track_ids = [None] * len(xyxy)
+                    track_ids = None
 
-                for box, class_id, confidence, track_id in zip(
-                    xyxy, class_ids, confidences, track_ids
-                ):
+                for i, (box, class_id, confidence) in enumerate(zip(boxes, classes, confidences)):
                     if class_id not in TARGET_CLASSES:
                         continue
 
                     class_name = TARGET_CLASSES[class_id]
-                    confidence = float(confidence)
-
-                    # Filter confidence per kelas. Motor lebih permisif
-                    # karena objek kecil di CCTV confidence-nya cenderung rendah.
-                    min_conf = MOTOR_MIN_CONF if class_name == "motor" else OTHER_MIN_CONF
-
-                    if confidence < min_conf:
-                        continue
-
                     raw_detection_counts[class_name] += 1
 
-                    # Hanya pakai ID asli dari ByteTrack (tanpa ID fallback,
-                    # supaya satu kendaraan tidak terhitung ganda).
-                    if track_id is None:
+                    min_conf = MOTOR_MIN_CONF if class_name == "motor" else OTHER_MIN_CONF
+                    if float(confidence) < min_conf:
                         continue
-
-                    track_id = int(track_id)
+                    accepted_detection_counts[class_name] += 1
 
                     x1, y1, x2, y2 = map(float, box)
                     center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
-                    # ----------------------------------------
-                    # COUNTING PER FRAME
-                    # ----------------------------------------
-                    state = tracks.get(track_id)
+                    # Tidak membuat track ID palsu. Hanya ID ByteTrack yang dipakai.
+                    if track_ids is None:
+                        continue
+                    track_id = int(track_ids[i])
 
-                    if state is None:
-                        state = TrackState()
-                        tracks[track_id] = state
+                    previous_center = previous_centers.get(track_id)
+                    track_class_votes[track_id][class_name] += 1
 
-                    state.observe(class_name, confidence)
+                    # --------------------------------------------------------
+                    # COUNTING DI DALAM LOOP
+                    # --------------------------------------------------------
+                    crossed_a = False
+                    if line_a is not None and previous_center is not None:
+                        crossed_a = crossed(previous_center, center, *line_a)
 
-                    if update_track_count(state, counted_classes):
-                        newly_confirmed += 1
+                    if COUNT_ON_LINE_A and line_a is not None:
+                        # Satu track dihitung saat pertama kali menyeberangi Line A.
+                        if crossed_a and track_id not in counted_track_ids:
+                            best_class = track_class_votes[track_id].most_common(1)[0][0]
+                            counted_classes[best_class] += 1
+                            counted_track_ids.add(track_id)
+                    elif line_a is None:
+                        # Tanpa garis hitung, hitung sekali saat track pertama terlihat.
+                        if track_id not in counted_track_ids:
+                            counted_classes[class_name] += 1
+                            counted_track_ids.add(track_id)
 
-                    # ----------------------------------------
-                    # SAVE DETECTION
-                    # ----------------------------------------
+                    # --------------------------------------------------------
+                    # SPEED: Line A -> Line B
+                    # --------------------------------------------------------
+                    if calibrated and previous_center is not None:
+                        crossed_b = crossed(previous_center, center, *line_b)
+
+                        if crossed_a and track_id not in line_a_times:
+                            line_a_times[track_id] = timestamp
+
+                        if crossed_b and track_id not in line_b_times:
+                            line_b_times[track_id] = timestamp
+
+                        if track_id in line_a_times and track_id in line_b_times:
+                            delta_t = abs(line_b_times[track_id] - line_a_times[track_id])
+                            if 0 < delta_t <= 60:
+                                speed_mps = distance_m / delta_t
+                                if 0 < speed_mps < 60:
+                                    speed_samples.append(speed_mps)
+                            line_a_times.pop(track_id, None)
+                            line_b_times.pop(track_id, None)
+
+                    previous_centers[track_id] = center
+
                     detections.append(
                         {
                             "x1": round(x1 / max(width, 1), 6),
@@ -469,155 +301,161 @@ def analyze_video(
                             "x2": round(x2 / max(width, 1), 6),
                             "y2": round(y2 / max(height, 1), 6),
                             "class": class_name,
-                            "confidence": round(confidence, 4),
+                            "confidence": round(float(confidence), 4),
                             "track_id": track_id,
-                            "confirmed": state.counted_class is not None,
                             "time": round(timestamp, 3),
                         }
                     )
 
-                    # ----------------------------------------
-                    # SPEED (Line A -> Line B)
-                    # ----------------------------------------
-                    previous_center = previous_centers.get(track_id)
-
-                    if calibrated and previous_center is not None:
-
-                        if track_id not in line_a_times and crossed(
-                            previous_center, center, *line_a
-                        ):
-                            line_a_times[track_id] = timestamp
-
-                        if track_id not in line_b_times and crossed(
-                            previous_center, center, *line_b
-                        ):
-                            line_b_times[track_id] = timestamp
-
-                        if track_id in line_a_times and track_id in line_b_times:
-                            delta_t = abs(line_b_times[track_id] - line_a_times[track_id])
-
-                            if 0 < delta_t <= 60:
-                                speed_mps = distance_m / delta_t
-
-                                if 0 < speed_mps < 60:
-                                    speed_samples.append(speed_mps)
-
-                            line_a_times.pop(track_id, None)
-                            line_b_times.pop(track_id, None)
-
-                    previous_centers[track_id] = center
-
+            timeline.append({"time": round(timestamp, 3), "detections": detections})
             processed_frames += 1
-            frame_index += 1
 
-            if include_timeline_in_final:
-                timeline.append(
-                    {"time": round(timestamp, 3), "detections": detections}
+            if processed_frames == 1 or processed_frames - last_yield_frame >= PROGRESS_EVERY_FRAMES:
+                last_yield_frame = processed_frames
+                yield _make_progress(
+                    route,
+                    timestamp,
+                    duration,
+                    counted_classes,
+                    speed_samples,
+                    frame_index,
+                    processed_frames,
+                    final=False,
                 )
 
-            # ------------------------------------------------
-            # EVENT: FRAME (STREAM KE FRONTEND)
-            # ------------------------------------------------
-            if processed_frames % emit_every == 0:
-                vehicles = vehicles_snapshot(counted_classes)
-
-                yield {
-                    "type": "frame",
-                    "time": round(timestamp, 3),
-                    "frame_index": frame_index,
-                    "processed_frames": processed_frames,
-                    "progress": (
-                        round(min(frame_index / frame_count, 1.0), 4)
-                        if frame_count > 0
-                        else None
-                    ),
-                    "vehicles": vehicles,
-                    "new_vehicles": newly_confirmed,
-                    "traffic": traffic_snapshot(
-                        vehicles["total"], timestamp, MIN_FLOW_WINDOW_SECONDS
-                    ),
-                    "speed": speed_snapshot(speed_samples, calibrated),
-                    "detections": detections,
-                }
-
-        # ====================================================
-        # EVENT: FINAL
-        # ====================================================
-        vehicles = vehicles_snapshot(counted_classes)
-
-        # Final: pakai durasi video penuh seperti versi lama.
-        final_seconds = duration if duration > 0 else last_timestamp
-        traffic = traffic_snapshot(vehicles["total"], final_seconds, 0.0)
-
-        unconfirmed_tracks = [
-            {
-                "track_id": int(track_id),
-                "class": state.best_class(),
-                "observations": state.observations,
-            }
-            for track_id, state in tracks.items()
-            if state.counted_class is None
-        ]
-
-        final_video = dict(video_info)
-        final_video["frames_processed"] = processed_frames
-
-        yield {
-            "type": "final",
-            "route": route,
-            "video": final_video,
-            "vehicles": vehicles,
-            "unique_track_count": len(tracks),
-            "track_debug": {
-                "confirmed": len(tracks) - len(unconfirmed_tracks),
-                "unconfirmed_count": len(unconfirmed_tracks),
-                # Track terlalu singkat (< MIN_TRACK_OBSERVATIONS) yang tidak dihitung.
-                "unconfirmed": unconfirmed_tracks[:50],
-            },
-            "raw_detection_counts": {
-                name: int(count) for name, count in raw_detection_counts.items()
-            },
-            "traffic": traffic,
-            "speed": speed_snapshot(speed_samples, calibrated),
-            "queue": {"available": False, "total": None, "status": "belum tersedia"},
-            "calibration": calibration_info,
-            "detections_timeline": timeline if include_timeline_in_final else None,
-            "analysis_runtime_seconds": round(time.time() - started_at, 3),
-            "model": MODEL_NAME,
-            "tracker": TRACKER,
-            "confidence_threshold": CONF_THRESHOLD,
-            "tracker_confidence_threshold": TRACK_CONF_THRESHOLD,
-            "motor_min_confidence": MOTOR_MIN_CONF,
-            "other_min_confidence": OTHER_MIN_CONF,
-            "min_track_observations": MIN_TRACK_OBSERVATIONS,
-            "inference_image_size": INFER_SIZE,
-            "source": "video asli",
-            "provenance": "AI YOLO + ByteTrack",
-            "random_data": False,
-        }
+            frame_index += 1
 
     finally:
         cap.release()
 
+    total = int(sum(counted_classes.values()))
+    flow_rate = total / (duration / 60.0) if duration > 0 else None
+    average_speed = _mean(speed_samples)
+
+    final = {
+        "route": route,
+        "video": {
+            "duration_seconds": round(duration, 3),
+            "fps": round(fps, 3),
+            "analysis_fps": round(process_fps, 3),
+            "frames": frame_count,
+            "frames_processed": processed_frames,
+            "resolution": {"width": width, "height": height},
+        },
+        "vehicles": {
+            "total": total,
+            "motor": int(counted_classes["motor"]),
+            "mobil": int(counted_classes["mobil"]),
+            "bus": int(counted_classes["bus"]),
+            "truk": int(counted_classes["truk"]),
+            "sepeda": int(counted_classes["sepeda"]),
+        },
+        "raw_detection_counts": {
+            "motor": int(raw_detection_counts["motor"]),
+            "mobil": int(raw_detection_counts["mobil"]),
+            "bus": int(raw_detection_counts["bus"]),
+            "truk": int(raw_detection_counts["truk"]),
+            "sepeda": int(raw_detection_counts["sepeda"]),
+        },
+        "accepted_detection_counts": {
+            "motor": int(accepted_detection_counts["motor"]),
+            "mobil": int(accepted_detection_counts["mobil"]),
+            "bus": int(accepted_detection_counts["bus"]),
+            "truk": int(accepted_detection_counts["truk"]),
+            "sepeda": int(accepted_detection_counts["sepeda"]),
+        },
+        "unique_track_count": int(len(track_class_votes)),
+        "counted_track_count": int(len(counted_track_ids)),
+        "traffic": {
+            "flow_rate_vehicles_per_minute": round(flow_rate, 3) if flow_rate is not None else None,
+            "status": _traffic_status(flow_rate),
+        },
+        "speed": {
+            "average_speed_mps": round(average_speed, 3) if average_speed is not None else None,
+            "sample_count": len(speed_samples),
+            "status": "terkalibrasi" if calibrated else "belum terkalibrasi",
+        },
+        "queue": {"available": False, "total": None, "status": "belum tersedia"},
+        "calibration": {
+            "distance_m": distance_m if distance_m > 0 else None,
+            "line_a_y": line_a_y,
+            "line_b_y": line_b_y,
+            "speed_calibrated": calibrated,
+            "counting_line_configured": line_a is not None,
+        },
+        "detections_timeline": timeline,
+        "analysis_runtime_seconds": round(time.time() - started_at, 3),
+        "model": MODEL_NAME,
+        "tracker": TRACKER,
+        "confidence_threshold": CONF_THRESHOLD if "CONF_THRESHOLD" in globals() else TRACK_CONF_THRESHOLD,
+        "tracker_confidence_threshold": TRACK_CONF_THRESHOLD,
+        "motor_min_confidence": MOTOR_MIN_CONF,
+        "other_min_confidence": OTHER_MIN_CONF,
+        "inference_image_size": INFER_SIZE,
+        "counting_mode": "line_a_crossing" if COUNT_ON_LINE_A and line_a is not None else "unique_track_fallback",
+        "source": "video asli",
+        "provenance": "AI YOLO + ByteTrack",
+        "random_data": False,
+    }
+
+    yield _make_progress(
+        route,
+        duration,
+        duration,
+        counted_classes,
+        speed_samples,
+        frame_index,
+        processed_frames,
+        final=True,
+    )
+
+    # The final detailed result is embedded in a second final message field.
+    yield {"type": "result", "result": final}
+
 
 # ============================================================
-# BACKWARD-COMPATIBLE WRAPPER
+# BACKWARD-COMPATIBLE API FOR CURRENT main.py
 # ============================================================
+def analyze_video(
+    video_path: Path,
+    route: str,
+    calibration_distance_m: float | None,
+    line_a_y: float | None,
+    line_b_y: float | None,
+):
+    """Return the final analysis dict for the existing job architecture.
 
-def analyze_video_blocking(*args, **kwargs) -> dict[str, Any]:
+    For realtime/job progress use analyze_video_stream(). Keeping this wrapper
+    prevents the existing main.py from breaking while the frontend still polls
+    /jobs/{job_id}.
     """
-    Menjalankan generator sampai habis dan mengembalikan event "final".
-    Untuk kode lama yang belum mendukung streaming. Timeline penuh
-    disertakan agar bentuk hasilnya setara dengan versi sebelumnya.
-    """
-    kwargs.setdefault("include_timeline_in_final", True)
-    final = None
+    final_result = None
+    for item in analyze_video_stream(
+        video_path=video_path,
+        route=route,
+        calibration_distance_m=calibration_distance_m,
+        line_a_y=line_a_y,
+        line_b_y=line_b_y,
+    ):
+        if item.get("type") == "result":
+            final_result = item["result"]
+    if final_result is None:
+        raise RuntimeError("Analisis selesai tanpa menghasilkan result.")
+    return final_result
 
-    for event in analyze_video(*args, **kwargs):
-        if event["type"] == "final":
-            final = event
 
-    if final is None:
-        raise RuntimeError("Analisis berakhir tanpa hasil akhir.")
-
-    return final
+# Backward-compatible name used by some older code.
+def analyze_video_generator(
+    video_path: Path,
+    route: str,
+    calibration_distance_m: float | None,
+    line_a_y: float | None,
+    line_b_y: float | None,
+):
+    yield from analyze_video_stream(
+        video_path=video_path,
+        route=route,
+        calibration_distance_m=calibration_distance_m,
+        line_a_y=line_a_y,
+        line_b_y=line_b_y,
+    )
